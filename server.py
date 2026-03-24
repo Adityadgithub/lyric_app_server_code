@@ -4,6 +4,7 @@ FastAPI server that:
 - optionally fetches synced lyrics from YouTube Music (ytmusicapi)
 """
 import logging
+import os
 import re
 from urllib.parse import unquote
 
@@ -199,7 +200,7 @@ def get_ytmusic_synced_lyrics(title: str, artist: str) -> str | None:
 @app.get("/")
 def root():
     logger.info("[API] Root / requested")
-    return {"message": "Lyrical Insta API", "docs": "/docs", "audio": "GET /api/audio?url=..."}
+    return {"message": "Server is running"}
 
 
 @app.get("/api/audio")
@@ -258,5 +259,7 @@ def api_lyrics(
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("[SERVER] Starting Lyrical Insta API on http://0.0.0.0:5000")
-    uvicorn.run(app, host="0.0.0.0", port=5000, log_level="info")
+
+    port = int(os.environ.get("PORT", "8000"))
+    logger.info("[SERVER] Starting Lyrical Insta API on host 0.0.0.0 port %s", port)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
