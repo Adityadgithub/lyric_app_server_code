@@ -37,44 +37,17 @@ app.add_middleware(
 ytmusic_client = YTMusic()
 
 
-def _yt_dlp_opts() -> dict:
-    """
-    Options for yt-dlp. YouTube often blocks anonymous requests from datacenter IPs
-    (e.g. Render) while the same code works from a home network. Alternate player
-    clients sometimes avoid the bot page; if it still fails, set YOUTUBE_COOKIES_FILE
-    to a Netscape-format cookies.txt (see yt-dlp wiki: exporting YouTube cookies).
-    """
-    opts: dict = {
+def get_audio_stream(url: str) -> dict:
+    """Extract audio stream URL and metadata using yt-dlp."""
+    logger.info(f"[get_audio_stream] Input URL: {url}")
+
+    ydl_opts = {
         "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        # Prefer mobile/TV-style clients first; they are less often hit with the
-        # datacenter "Sign in to confirm you're not a bot" interstitial than web.
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "web"],
-            },
-        },
     }
-    cookies_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
-    if cookies_path and os.path.isfile(cookies_path):
-        opts["cookiefile"] = cookies_path
-        logger.info("[get_audio_stream] Using cookiefile from YOUTUBE_COOKIES_FILE")
-    elif cookies_path:
-        logger.warning(
-            "[get_audio_stream] YOUTUBE_COOKIES_FILE is set but not a file: %s",
-            cookies_path,
-        )
-    return opts
-
-
-def get_audio_stream(url: str) -> dict:
-    """Extract audio stream URL and metadata using yt-dlp."""
-    logger.info(f"[get_audio_stream] Input URL: {url}")
-
-    ydl_opts = _yt_dlp_opts()
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
