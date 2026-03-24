@@ -80,21 +80,15 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     Options for yt-dlp. YouTube often blocks anonymous requests from datacenter IPs
     (e.g. Render) while the same code works from a home network.
 
-    Important: with a cookie file, yt-dlp **skips** Android/iOS clients and uses the
-    **web** client only. The web client needs a JS runtime for YouTube's n/signature
-    challenges (see https://github.com/yt-dlp/yt-dlp/wiki/EJS ). Without that, you may
-    get only storyboard images and "Requested format is not available" — not bad
-    cookies, missing EJS.
-
-    Extraction order in ``get_audio_stream`` tries **without** cookies first when a
-    cookie file exists (mobile clients work on many home IPs), then retries **with**
-    cookies only after a bot-style error (e.g. on Render).
+    With a cookie file, yt-dlp skips Android/iOS and uses the web client only for
+    that attempt. ``get_audio_stream`` tries without cookies first when a cookie
+    file exists, then retries with cookies after bot-style errors.
     """
     resolved_path, resolved_source = _resolve_youtube_cookiefile()
     if skip_cookiefile:
         if resolved_path:
             logger.info(
-                "[yt-dlp] Attempt without cookies (%s present); avoids web-only + EJS requirement.",
+                "[yt-dlp] Attempt without cookies (%s present); mobile clients allowed.",
                 resolved_source,
             )
         cookies_path, cookies_source = None, None
@@ -106,7 +100,7 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     )
 
     opts: dict = {
-        "format": "bestaudio/best/worstaudio/worst",
+        "format": "best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -124,15 +118,37 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
 
 
 def _info_dict_to_stream_result(info: dict) -> dict:
-    """Turn yt-dlp processed info into our API payload."""
-    audio_url = info.get("url")
-    if not audio_url and info.get("formats"):
-        for fmt in info.get("formats", []):
-            if fmt.get("url") and fmt.get("vcodec") == "none":
+    """Pick a playable URL from yt-dlp format entries (avoid relying on top-level url)."""
+    formats = info.get("formats", [])
+
+    audio_url = None
+
+    preferred_itags = [251, 250, 249, 140]
+
+    for itag in preferred_itags:
+        for fmt in formats:
+            if fmt.get("itag") == itag and fmt.get("url"):
                 audio_url = fmt["url"]
                 break
-        if not audio_url and info["formats"]:
-            audio_url = info["formats"][0].get("url")
+        if audio_url:
+            break
+
+    if not audio_url:
+        for fmt in formats:
+            if fmt.get("vcodec") == "none" and fmt.get("acodec") != "none":
+                audio_url = fmt.get("url")
+                if audio_url:
+                    break
+
+    if not audio_url:
+        for fmt in formats:
+            if fmt.get("acodec") != "none":
+                audio_url = fmt.get("url")
+                if audio_url:
+                    break
+
+    if not audio_url and formats:
+        audio_url = formats[0].get("url")
 
     if not audio_url:
         raise ValueError("No audio stream URL found")
@@ -194,17 +210,6 @@ def get_audio_stream(url: str) -> dict:
                     msg[:160],
                 )
                 continue
-            if (
-                not skip_cookies
-                and cookie_path
-                and "format is not available" in msg.casefold()
-            ):
-                logger.error(
-                    "[get_audio_stream] Cookie + web client failed format selection. "
-                    "Install a JS runtime for yt-dlp (EJS): "
-                    "https://github.com/yt-dlp/yt-dlp/wiki/EJS — "
-                    "or use the no-cookie path from a non-datacenter IP."
-                )
             logger.exception(f"[get_audio_stream] Error extracting audio: {e}")
             raise
 
