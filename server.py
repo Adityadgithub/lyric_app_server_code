@@ -6,6 +6,7 @@ FastAPI server that:
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -47,20 +48,44 @@ _DEFAULT_COOKIES_FILE = _BACKEND_DIR / "cookies.txt"
 
 def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
     """
-    Cookie file for yt-dlp: YOUTUBE_COOKIES_FILE if set and valid, else
-    backend/cookies.txt next to this module when that file exists.
-    Returns (path, log_label) or (None, None).
+    Locate the cookies.txt file and return a WRITABLE copy at /tmp/cookies.txt.
+
+    Render (and similar hosts) mount secrets at read-only paths like
+    /etc/secrets/cookies.txt. yt-dlp occasionally needs to write back to the
+    cookie file, which causes a crash on read-only mounts. Copying to /tmp
+    first avoids that entirely.
+
+    Resolution order:
+      1. YOUTUBE_COOKIES_FILE env var
+      2. backend/cookies.txt next to this module
+    Returns (writable_path, source_label) or (None, None).
     """
+    _TMP_COOKIES = "/tmp/cookies.txt"
+
+    def _copy_to_tmp(src: str, label: str) -> tuple[str, str]:
+        try:
+            os.makedirs("/tmp", exist_ok=True)
+            shutil.copy2(src, "/tmp/cookies.txt")
+            logger.info("[cookies] Copied %s → /tmp/cookies.txt", label)
+            return "/tmp/cookies.txt", label
+        except Exception as exc:
+            logger.warning("[cookies] Copy failed: %s", exc)
+            return src, label
+
     env_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    logger.info("[cookies] YOUTUBE_COOKIES_FILE = %r  exists = %s",
+                env_path or "(not set)", os.path.isfile(env_path) if env_path else False)
+
     if env_path:
         if os.path.isfile(env_path):
-            return env_path, "YOUTUBE_COOKIES_FILE"
-        logger.warning(
-            "[yt-dlp] YOUTUBE_COOKIES_FILE is set but not a file: %s",
-            env_path,
-        )
+            return _copy_to_tmp(env_path, "YOUTUBE_COOKIES_FILE")
+        logger.warning("[cookies] YOUTUBE_COOKIES_FILE is set but not a file: %s", env_path)
+
+    logger.info("[cookies] backend/cookies.txt exists = %s", _DEFAULT_COOKIES_FILE.is_file())
     if _DEFAULT_COOKIES_FILE.is_file():
-        return str(_DEFAULT_COOKIES_FILE), "backend/cookies.txt"
+        return _copy_to_tmp(str(_DEFAULT_COOKIES_FILE), "backend/cookies.txt")
+
+    logger.warning("[cookies] No cookies.txt found — requests will be unauthenticated")
     return None, None
 
 
@@ -83,9 +108,8 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     Options for yt-dlp. YouTube often blocks anonymous requests from datacenter IPs
     (e.g. Render) while the same code works from a home network.
 
-    With a cookie file, yt-dlp skips Android/iOS and uses the web client only for
-    that attempt. ``get_audio_stream`` tries without cookies first when a cookie
-    file exists, then retries with cookies after bot-style errors.
+    ``get_audio_stream`` tries without cookies first when a cookie file exists,
+    then retries with cookies after bot-style errors.
     """
     resolved_path, resolved_source = _resolve_youtube_cookiefile()
     if skip_cookiefile:
@@ -98,19 +122,20 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     else:
         cookies_path, cookies_source = resolved_path, resolved_source
 
-    player_client = (
-        ["web", "android", "ios"] if cookies_path else ["android", "ios", "web"]
-    )
+    logger.info("[cookies] FINAL COOKIE PATH USED: %s", cookies_path)
 
     opts: dict = {
-        "format": "best",
+        "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0",
+        },
         "extractor_args": {
             "youtube": {
-                "player_client": player_client,
+                "player_client": ["android", "web"],
             },
         },
     }
@@ -422,7 +447,7 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
         "skip_download": True,
         "noplaylist": True,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "web"]},
+            "youtube": {"player_client": ["android", "web"]},
         },
     }
     if cookie_path:
@@ -518,6 +543,7 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
         "--no-part",
         "-o", "-",
         "--quiet",
+        "--extractor-args", "youtube:player_client=android",
     ]
     if cookie_path:
         command += ["--cookies", cookie_path]
