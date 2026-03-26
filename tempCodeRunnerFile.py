@@ -1,3 +1,4 @@
+
 """
 FastAPI server that:
 - extracts audio stream URLs from YouTube/other video links using yt-dlp
@@ -6,6 +7,7 @@ FastAPI server that:
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -47,21 +49,36 @@ _DEFAULT_COOKIES_FILE = _BACKEND_DIR / "cookies.txt"
 
 def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
     """
-    Cookie file for yt-dlp: YOUTUBE_COOKIES_FILE if set and valid, else
-    backend/cookies.txt next to this module when that file exists.
-    Returns (path, log_label) or (None, None).
+    Use local cookies.txt if available.
+    On Render, copy to /tmp to avoid permission issues.
     """
-    env_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
-    if env_path:
-        if os.path.isfile(env_path):
-            return env_path, "YOUTUBE_COOKIES_FILE"
-        logger.warning(
-            "[yt-dlp] YOUTUBE_COOKIES_FILE is set but not a file: %s",
-            env_path,
-        )
-    if _DEFAULT_COOKIES_FILE.is_file():
-        return str(_DEFAULT_COOKIES_FILE), "backend/cookies.txt"
-    return None, None
+    local_path = _DEFAULT_COOKIES_FILE
+
+    logger.info("[cookies] Checking local cookies.txt...")
+    logger.info("[cookies] Path: %s", local_path)
+
+    if not local_path.is_file():
+        logger.warning("[cookies] ❌ cookies.txt NOT FOUND")
+        return None, None
+
+    # Try using directly first (works locally)
+    try:
+        test = open(local_path, "rb")
+        test.close()
+        logger.info("[cookies] ✅ Using local cookies.txt directly")
+        return str(local_path), "local file"
+    except Exception:
+        pass
+
+    # Fallback for Render (read-only fix)
+    tmp_path = "/tmp/cookies.txt"
+    try:
+        shutil.copy2(local_path, tmp_path)
+        logger.info("[cookies] Copied to /tmp -> %s", tmp_path)
+        return tmp_path, "tmp copy"
+    except Exception as e:
+        logger.warning("[cookies] ❌ Failed to copy to /tmp: %s", e)
+        return str(local_path), "fallback local"
 
 
 def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
@@ -79,28 +96,19 @@ def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
 
 
 def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
-    """
-    Options for yt-dlp. YouTube often blocks anonymous requests from datacenter IPs
-    (e.g. Render) while the same code works from a home network.
-
-    With a cookie file, yt-dlp skips Android/iOS and uses the web client only for
-    that attempt. ``get_audio_stream`` tries without cookies first when a cookie
-    file exists, then retries with cookies after bot-style errors.
-    """
     resolved_path, resolved_source = _resolve_youtube_cookiefile()
-    if skip_cookiefile:
-        if resolved_path:
-            logger.info(
-                "[yt-dlp] Attempt without cookies (%s present); mobile clients allowed.",
-                resolved_source,
-            )
-        cookies_path, cookies_source = None, None
-    else:
-        cookies_path, cookies_source = resolved_path, resolved_source
 
-    player_client = (
-        ["web", "android", "ios"] if cookies_path else ["android", "ios", "web"]
-    )
+    if skip_cookiefile:
+        # ✅ NO cookies → allow mobile clients (best formats)
+        cookies_path = None
+        player_client = ["android", "ios", "web"]
+        logger.info("[yt-dlp] Using NO cookies (mobile clients enabled)")
+    else:
+        # ✅ WITH cookies → ONLY web client (important!)
+        cookies_path = resolved_path
+        player_client = ["web"]
+        if cookies_path:
+            logger.info("[yt-dlp] Using cookies (web client only)")
 
     opts: dict = {
         "format": "best",
@@ -114,9 +122,10 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
             },
         },
     }
+
     if cookies_path:
         opts["cookiefile"] = cookies_path
-        logger.info("[yt-dlp] Using cookiefile (%s)", cookies_source)
+
     return opts
 
 
@@ -392,6 +401,108 @@ def api_lyrics(
         }
 
 
+_EXT_TO_MIME: dict[str, str] = {
+    "m4a":  "audio/mp4",
+    "mp3":  "audio/mpeg",
+    "webm": "audio/webm",
+    "ogg":  "audio/ogg",
+    "opus": "audio/ogg",
+    "aac":  "audio/aac",
+    "flac": "audio/flac",
+    "wav":  "audio/wav",
+}
+
+
+def _pick_best_stream_format(url: str) -> tuple[str, str]:
+    """
+    Use yt-dlp Python API to inspect available formats and return
+    (format_id, mime_type) for the best audio-only stream.
+
+    Priority (audio-only only — no video tracks):
+      1. m4a  (AAC)  — best mobile compatibility
+      2. webm (Opus) — high quality fallback
+      3. Any remaining audio-only format by bitrate
+    Falls back to ("bestaudio", "audio/mp4") if detection fails.
+    """
+    cookie_path, cookie_source = _resolve_youtube_cookiefile()
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extractor_args": {
+            "youtube": {"player_client": ["web"]},
+        },
+    }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+        logger.info("[stream-fmt] Using cookiefile (%s)", cookie_source)
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            logger.warning("[stream-fmt] No info returned — falling back to bestaudio")
+            return "bestaudio", "audio/mp4"
+
+        formats = info.get("formats", [])
+
+        # Keep only pure audio-only formats (no video track at all)
+        audio_only = [
+            f for f in formats
+            if f.get("vcodec") in (None, "none")
+            and f.get("acodec") not in (None, "none")
+            and f.get("url")
+        ]
+
+        logger.info(
+            "[stream-fmt] Audio-only formats available: %s",
+            [
+                f"{f.get('format_id')} ({f.get('ext')}, {f.get('abr') or f.get('tbr', '?')} kbps)"
+                for f in audio_only
+            ],
+        )
+
+        if not audio_only:
+            logger.warning("[stream-fmt] No audio-only formats found — falling back to bestaudio")
+            return "bestaudio", "audio/mp4"
+
+        # 1. Best m4a (AAC) — most compatible with Android ExoPlayer / iOS
+        m4a = [f for f in audio_only if f.get("ext") == "m4a"]
+        if m4a:
+            best = max(m4a, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+            logger.info(
+                "[stream-fmt] ✔ Selected m4a (AAC) → format_id=%s  abr=%s kbps",
+                best["format_id"], best.get("abr"),
+            )
+            return best["format_id"], "audio/mp4"
+
+        # 2. Best webm (Opus)
+        webm = [f for f in audio_only if f.get("ext") == "webm"]
+        if webm:
+            best = max(webm, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+            logger.info(
+                "[stream-fmt] ✔ Selected webm (Opus) → format_id=%s  abr=%s kbps",
+                best["format_id"], best.get("abr"),
+            )
+            return best["format_id"], "audio/webm"
+
+        # 3. Best of whatever is left
+        best = max(audio_only, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+        ext = best.get("ext", "")
+        mime = _EXT_TO_MIME.get(ext, "audio/mp4")
+        logger.info(
+            "[stream-fmt] ✔ Selected best audio → format_id=%s  ext=%s  abr=%s kbps  mime=%s",
+            best["format_id"], ext, best.get("abr"), mime,
+        )
+        return best["format_id"], mime
+
+    except Exception as e:
+        logger.warning("[stream-fmt] Format detection failed (%s) — using bestaudio", e)
+        return "bestaudio", "audio/mp4"
+
+
 @app.get("/api/stream")
 def api_stream(url: str = Query(..., description="YouTube or other video URL")):
     """
@@ -403,15 +514,17 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
     raw_url = unquote(url)
     logger.info("[API] /api/stream called for: %s", raw_url[:100])
 
+    # Detect the best available audio-only format before spawning the subprocess
+    format_id, mime_type = _pick_best_stream_format(raw_url)
+    logger.info("[API] /api/stream → format_id=%s  mime=%s", format_id, mime_type)
+
     cookie_path, cookie_source = _resolve_youtube_cookiefile()
 
     command = [
         "yt-dlp",
-        "-f", "bestaudio[ext=m4a]/bestaudio",
+        "-f", format_id,
         "--no-playlist",
         "--no-part",
-        "--remote-components", "ejs:github",
-        "--extractor-args", "youtube:player_client=web",
         "-o", "-",
         "--quiet",
     ]
@@ -453,7 +566,7 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
 
     return StreamingResponse(
         _iter_chunks(process),
-        media_type="application/octet-stream",
+        media_type=mime_type,
         headers={
             "Accept-Ranges": "none",
             "Content-Disposition": "inline",

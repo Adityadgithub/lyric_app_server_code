@@ -49,36 +49,36 @@ _DEFAULT_COOKIES_FILE = _BACKEND_DIR / "cookies.txt"
 
 def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
     """
-    Use local cookies.txt if available.
-    On Render, copy to /tmp to avoid permission issues.
+    Always return a writable cookie file path (Render-safe)
     """
+
+    TMP_PATH = "/tmp/cookies.txt"
+
+    def copy_to_tmp(src: str, label: str):
+        try:
+            shutil.copy2(src, TMP_PATH)
+            logger.info(f"[cookies] ✅ Copied {label} → {TMP_PATH}")
+            return TMP_PATH, label
+        except Exception as e:
+            logger.warning(f"[cookies] ❌ Copy failed: {e}")
+            return src, label
+
+    # 1. ENV (Render secret file)
+    env_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+
+    if env_path and os.path.isfile(env_path):
+        logger.info("[cookies] Using ENV cookie file")
+        return copy_to_tmp(env_path, "ENV")
+
+    # 2. Local fallback
     local_path = _DEFAULT_COOKIES_FILE
 
-    logger.info("[cookies] Checking local cookies.txt...")
-    logger.info("[cookies] Path: %s", local_path)
+    if local_path.is_file():
+        logger.info("[cookies] Using local cookies.txt")
+        return copy_to_tmp(str(local_path), "local")
 
-    if not local_path.is_file():
-        logger.warning("[cookies] ❌ cookies.txt NOT FOUND")
-        return None, None
-
-    # Try using directly first (works locally)
-    try:
-        test = open(local_path, "rb")
-        test.close()
-        logger.info("[cookies] ✅ Using local cookies.txt directly")
-        return str(local_path), "local file"
-    except Exception:
-        pass
-
-    # Fallback for Render (read-only fix)
-    tmp_path = "/tmp/cookies.txt"
-    try:
-        shutil.copy2(local_path, tmp_path)
-        logger.info("[cookies] Copied to /tmp -> %s", tmp_path)
-        return tmp_path, "tmp copy"
-    except Exception as e:
-        logger.warning("[cookies] ❌ Failed to copy to /tmp: %s", e)
-        return str(local_path), "fallback local"
+    logger.warning("[cookies] ❌ No cookies found")
+    return None, None
 
 
 def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
