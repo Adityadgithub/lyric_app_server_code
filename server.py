@@ -1,3 +1,4 @@
+
 """
 FastAPI server that:
 - extracts audio stream URLs from YouTube/other video links using yt-dlp
@@ -60,17 +61,17 @@ def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
       2. backend/cookies.txt next to this module
     Returns (writable_path, source_label) or (None, None).
     """
-    _TMP_COOKIES = "/tmp/cookies.txt"
+    _TMP_COOKIES = "backend/cookies.txt"
 
     def _copy_to_tmp(src: str, label: str) -> tuple[str, str]:
         try:
-            os.makedirs("/tmp", exist_ok=True)
-            shutil.copy2(src, "/tmp/cookies.txt")
-            logger.info("[cookies] Copied %s → /tmp/cookies.txt", label)
-            return "/tmp/cookies.txt", label
+            shutil.copy2(src, _TMP_COOKIES)
+            logger.info("[cookies] Copied %s → %s (writable)", label, _TMP_COOKIES)
         except Exception as exc:
-            logger.warning("[cookies] Copy failed: %s", exc)
+            logger.warning("[cookies] Could not copy to /tmp (%s) — using original path", exc)
             return src, label
+        logger.info("[cookies] FINAL COOKIE PATH USED: %s", _TMP_COOKIES)
+        return _TMP_COOKIES, label
 
     env_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
     logger.info("[cookies] YOUTUBE_COOKIES_FILE = %r  exists = %s",
@@ -108,8 +109,9 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     Options for yt-dlp. YouTube often blocks anonymous requests from datacenter IPs
     (e.g. Render) while the same code works from a home network.
 
-    ``get_audio_stream`` tries without cookies first when a cookie file exists,
-    then retries with cookies after bot-style errors.
+    With a cookie file, yt-dlp skips Android/iOS and uses the web client only for
+    that attempt. ``get_audio_stream`` tries without cookies first when a cookie
+    file exists, then retries with cookies after bot-style errors.
     """
     resolved_path, resolved_source = _resolve_youtube_cookiefile()
     if skip_cookiefile:
@@ -122,20 +124,19 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     else:
         cookies_path, cookies_source = resolved_path, resolved_source
 
-    logger.info("[cookies] FINAL COOKIE PATH USED: %s", cookies_path)
+    player_client = (
+        ["web", "android", "ios"] if cookies_path else ["android", "ios", "web"]
+    )
 
     opts: dict = {
-        "format": "bestaudio/best",
+        "format": "best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0",
-        },
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": player_client,
             },
         },
     }
@@ -447,7 +448,7 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
         "skip_download": True,
         "noplaylist": True,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "web"]},
+            "youtube": {"player_client": ["android", "ios", "web"]},
         },
     }
     if cookie_path:
@@ -543,7 +544,6 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
         "--no-part",
         "-o", "-",
         "--quiet",
-        "--extractor-args", "youtube:player_client=android",
     ]
     if cookie_path:
         command += ["--cookies", cookie_path]
