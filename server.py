@@ -49,45 +49,36 @@ _DEFAULT_COOKIES_FILE = _BACKEND_DIR / "cookies.txt"
 
 def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
     """
-    Locate the cookies.txt file and return a WRITABLE copy at /tmp/cookies.txt.
-
-    Render (and similar hosts) mount secrets at read-only paths like
-    /etc/secrets/cookies.txt. yt-dlp occasionally needs to write back to the
-    cookie file, which causes a crash on read-only mounts. Copying to /tmp
-    first avoids that entirely.
-
-    Resolution order:
-      1. YOUTUBE_COOKIES_FILE env var
-      2. backend/cookies.txt next to this module
-    Returns (writable_path, source_label) or (None, None).
+    Use local cookies.txt if available.
+    On Render, copy to /tmp to avoid permission issues.
     """
-    _TMP_COOKIES = "backend/cookies.txt"
+    local_path = _DEFAULT_COOKIES_FILE
 
-    def _copy_to_tmp(src: str, label: str) -> tuple[str, str]:
-        try:
-            shutil.copy2(src, _TMP_COOKIES)
-            logger.info("[cookies] Copied %s → %s (writable)", label, _TMP_COOKIES)
-        except Exception as exc:
-            logger.warning("[cookies] Could not copy to /tmp (%s) — using original path", exc)
-            return src, label
-        logger.info("[cookies] FINAL COOKIE PATH USED: %s", _TMP_COOKIES)
-        return _TMP_COOKIES, label
+    logger.info("[cookies] Checking local cookies.txt...")
+    logger.info("[cookies] Path: %s", local_path)
 
-    env_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
-    logger.info("[cookies] YOUTUBE_COOKIES_FILE = %r  exists = %s",
-                env_path or "(not set)", os.path.isfile(env_path) if env_path else False)
+    if not local_path.is_file():
+        logger.warning("[cookies] ❌ cookies.txt NOT FOUND")
+        return None, None
 
-    if env_path:
-        if os.path.isfile(env_path):
-            return _copy_to_tmp(env_path, "YOUTUBE_COOKIES_FILE")
-        logger.warning("[cookies] YOUTUBE_COOKIES_FILE is set but not a file: %s", env_path)
+    # Try using directly first (works locally)
+    try:
+        test = open(local_path, "rb")
+        test.close()
+        logger.info("[cookies] ✅ Using local cookies.txt directly")
+        return str(local_path), "local file"
+    except Exception:
+        pass
 
-    logger.info("[cookies] backend/cookies.txt exists = %s", _DEFAULT_COOKIES_FILE.is_file())
-    if _DEFAULT_COOKIES_FILE.is_file():
-        return _copy_to_tmp(str(_DEFAULT_COOKIES_FILE), "backend/cookies.txt")
-
-    logger.warning("[cookies] No cookies.txt found — requests will be unauthenticated")
-    return None, None
+    # Fallback for Render (read-only fix)
+    tmp_path = "/tmp/cookies.txt"
+    try:
+        shutil.copy2(local_path, tmp_path)
+        logger.info("[cookies] Copied to /tmp -> %s", tmp_path)
+        return tmp_path, "tmp copy"
+    except Exception as e:
+        logger.warning("[cookies] ❌ Failed to copy to /tmp: %s", e)
+        return str(local_path), "fallback local"
 
 
 def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
@@ -105,28 +96,19 @@ def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
 
 
 def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
-    """
-    Options for yt-dlp. YouTube often blocks anonymous requests from datacenter IPs
-    (e.g. Render) while the same code works from a home network.
-
-    With a cookie file, yt-dlp skips Android/iOS and uses the web client only for
-    that attempt. ``get_audio_stream`` tries without cookies first when a cookie
-    file exists, then retries with cookies after bot-style errors.
-    """
     resolved_path, resolved_source = _resolve_youtube_cookiefile()
-    if skip_cookiefile:
-        if resolved_path:
-            logger.info(
-                "[yt-dlp] Attempt without cookies (%s present); mobile clients allowed.",
-                resolved_source,
-            )
-        cookies_path, cookies_source = None, None
-    else:
-        cookies_path, cookies_source = resolved_path, resolved_source
 
-    player_client = (
-        ["web", "android", "ios"] if cookies_path else ["android", "ios", "web"]
-    )
+    if skip_cookiefile:
+        # ✅ NO cookies → allow mobile clients (best formats)
+        cookies_path = None
+        player_client = ["android", "ios", "web"]
+        logger.info("[yt-dlp] Using NO cookies (mobile clients enabled)")
+    else:
+        # ✅ WITH cookies → ONLY web client (important!)
+        cookies_path = resolved_path
+        player_client = ["web"]
+        if cookies_path:
+            logger.info("[yt-dlp] Using cookies (web client only)")
 
     opts: dict = {
         "format": "best",
@@ -140,9 +122,10 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
             },
         },
     }
+
     if cookies_path:
         opts["cookiefile"] = cookies_path
-        logger.info("[yt-dlp] Using cookiefile (%s)", cookies_source)
+
     return opts
 
 
@@ -448,7 +431,7 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
         "skip_download": True,
         "noplaylist": True,
         "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "web"]},
+            "youtube": {"player_client": ["web"]},
         },
     }
     if cookie_path:
