@@ -9,8 +9,11 @@ import re
 from pathlib import Path
 from urllib.parse import unquote
 
+import subprocess
+
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import yt_dlp
 from yt_dlp.utils import DownloadError
 from ytmusicapi import YTMusic
@@ -387,6 +390,179 @@ def api_lyrics(
             "synced_lyrics": None,
             "detail": str(e),
         }
+
+
+_EXT_TO_MIME: dict[str, str] = {
+    "m4a":  "audio/mp4",
+    "mp3":  "audio/mpeg",
+    "webm": "audio/webm",
+    "ogg":  "audio/ogg",
+    "opus": "audio/ogg",
+    "aac":  "audio/aac",
+    "flac": "audio/flac",
+    "wav":  "audio/wav",
+}
+
+
+def _pick_best_stream_format(url: str) -> tuple[str, str]:
+    """
+    Use yt-dlp Python API to inspect available formats and return
+    (format_id, mime_type) for the best audio-only stream.
+
+    Priority (audio-only only — no video tracks):
+      1. m4a  (AAC)  — best mobile compatibility
+      2. webm (Opus) — high quality fallback
+      3. Any remaining audio-only format by bitrate
+    Falls back to ("bestaudio", "audio/mp4") if detection fails.
+    """
+    cookie_path, cookie_source = _resolve_youtube_cookiefile()
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extractor_args": {
+            "youtube": {"player_client": ["android", "ios", "web"]},
+        },
+    }
+    if cookie_path:
+        opts["cookiefile"] = cookie_path
+        logger.info("[stream-fmt] Using cookiefile (%s)", cookie_source)
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            logger.warning("[stream-fmt] No info returned — falling back to bestaudio")
+            return "bestaudio", "audio/mp4"
+
+        formats = info.get("formats", [])
+
+        # Keep only pure audio-only formats (no video track at all)
+        audio_only = [
+            f for f in formats
+            if f.get("vcodec") in (None, "none")
+            and f.get("acodec") not in (None, "none")
+            and f.get("url")
+        ]
+
+        logger.info(
+            "[stream-fmt] Audio-only formats available: %s",
+            [
+                f"{f.get('format_id')} ({f.get('ext')}, {f.get('abr') or f.get('tbr', '?')} kbps)"
+                for f in audio_only
+            ],
+        )
+
+        if not audio_only:
+            logger.warning("[stream-fmt] No audio-only formats found — falling back to bestaudio")
+            return "bestaudio", "audio/mp4"
+
+        # 1. Best m4a (AAC) — most compatible with Android ExoPlayer / iOS
+        m4a = [f for f in audio_only if f.get("ext") == "m4a"]
+        if m4a:
+            best = max(m4a, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+            logger.info(
+                "[stream-fmt] ✔ Selected m4a (AAC) → format_id=%s  abr=%s kbps",
+                best["format_id"], best.get("abr"),
+            )
+            return best["format_id"], "audio/mp4"
+
+        # 2. Best webm (Opus)
+        webm = [f for f in audio_only if f.get("ext") == "webm"]
+        if webm:
+            best = max(webm, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+            logger.info(
+                "[stream-fmt] ✔ Selected webm (Opus) → format_id=%s  abr=%s kbps",
+                best["format_id"], best.get("abr"),
+            )
+            return best["format_id"], "audio/webm"
+
+        # 3. Best of whatever is left
+        best = max(audio_only, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+        ext = best.get("ext", "")
+        mime = _EXT_TO_MIME.get(ext, "audio/mp4")
+        logger.info(
+            "[stream-fmt] ✔ Selected best audio → format_id=%s  ext=%s  abr=%s kbps  mime=%s",
+            best["format_id"], ext, best.get("abr"), mime,
+        )
+        return best["format_id"], mime
+
+    except Exception as e:
+        logger.warning("[stream-fmt] Format detection failed (%s) — using bestaudio", e)
+        return "bestaudio", "audio/mp4"
+
+
+@app.get("/api/stream")
+def api_stream(url: str = Query(..., description="YouTube or other video URL")):
+    """
+    Stream audio directly to the client by piping yt-dlp stdout.
+
+    Flutter's ExoPlayer hits this endpoint instead of a short-lived
+    googlevideo.com URL, so there are no 403 / cookie / IP issues.
+    """
+    raw_url = unquote(url)
+    logger.info("[API] /api/stream called for: %s", raw_url[:100])
+
+    # Detect the best available audio-only format before spawning the subprocess
+    format_id, mime_type = _pick_best_stream_format(raw_url)
+    logger.info("[API] /api/stream → format_id=%s  mime=%s", format_id, mime_type)
+
+    cookie_path, cookie_source = _resolve_youtube_cookiefile()
+
+    command = [
+        "yt-dlp",
+        "-f", format_id,
+        "--no-playlist",
+        "--no-part",
+        "-o", "-",
+        "--quiet",
+    ]
+    if cookie_path:
+        command += ["--cookies", cookie_path]
+        logger.info("[API] /api/stream using cookiefile (%s)", cookie_source)
+
+    command.append(raw_url)
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="yt-dlp executable not found. Make sure it is installed and on PATH.",
+        )
+    except Exception as e:
+        logger.error("[API] /api/stream failed to start yt-dlp: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    def _iter_chunks(proc: subprocess.Popen, chunk_size: int = 64 * 1024):
+        try:
+            while True:
+                chunk = proc.stdout.read(chunk_size)
+                if not chunk:
+                    err = proc.stderr.read().decode(errors="replace")
+                    if err.strip():
+                        logger.error("[API] /api/stream yt-dlp stderr: %s", err)
+                    break
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+            logger.info("[API] /api/stream yt-dlp process finished (rc=%s)", proc.returncode)
+
+    return StreamingResponse(
+        _iter_chunks(process),
+        media_type=mime_type,
+        headers={
+            "Accept-Ranges": "none",
+            "Content-Disposition": "inline",
+        },
+    )
 
 
 if __name__ == "__main__":

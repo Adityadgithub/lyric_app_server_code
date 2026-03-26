@@ -9,8 +9,11 @@ import re
 from pathlib import Path
 from urllib.parse import unquote
 
+import subprocess
+
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import yt_dlp
 from yt_dlp.utils import DownloadError
 from ytmusicapi import YTMusic
@@ -80,21 +83,15 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     Options for yt-dlp. YouTube often blocks anonymous requests from datacenter IPs
     (e.g. Render) while the same code works from a home network.
 
-    Important: with a cookie file, yt-dlp **skips** Android/iOS clients and uses the
-    **web** client only. The web client needs a JS runtime for YouTube's n/signature
-    challenges (see https://github.com/yt-dlp/yt-dlp/wiki/EJS ). Without that, you may
-    get only storyboard images and "Requested format is not available" — not bad
-    cookies, missing EJS.
-
-    Extraction order in ``get_audio_stream`` tries **without** cookies first when a
-    cookie file exists (mobile clients work on many home IPs), then retries **with**
-    cookies only after a bot-style error (e.g. on Render).
+    With a cookie file, yt-dlp skips Android/iOS and uses the web client only for
+    that attempt. ``get_audio_stream`` tries without cookies first when a cookie
+    file exists, then retries with cookies after bot-style errors.
     """
     resolved_path, resolved_source = _resolve_youtube_cookiefile()
     if skip_cookiefile:
         if resolved_path:
             logger.info(
-                "[yt-dlp] Attempt without cookies (%s present); avoids web-only + EJS requirement.",
+                "[yt-dlp] Attempt without cookies (%s present); mobile clients allowed.",
                 resolved_source,
             )
         cookies_path, cookies_source = None, None
@@ -106,7 +103,7 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     )
 
     opts: dict = {
-        "format": "bestaudio/best/worstaudio/worst",
+        "format": "best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -124,15 +121,37 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
 
 
 def _info_dict_to_stream_result(info: dict) -> dict:
-    """Turn yt-dlp processed info into our API payload."""
-    audio_url = info.get("url")
-    if not audio_url and info.get("formats"):
-        for fmt in info.get("formats", []):
-            if fmt.get("url") and fmt.get("vcodec") == "none":
+    """Pick a playable URL from yt-dlp format entries (avoid relying on top-level url)."""
+    formats = info.get("formats", [])
+
+    audio_url = None
+
+    preferred_itags = [251, 250, 249, 140]
+
+    for itag in preferred_itags:
+        for fmt in formats:
+            if fmt.get("itag") == itag and fmt.get("url"):
                 audio_url = fmt["url"]
                 break
-        if not audio_url and info["formats"]:
-            audio_url = info["formats"][0].get("url")
+        if audio_url:
+            break
+
+    if not audio_url:
+        for fmt in formats:
+            if fmt.get("vcodec") == "none" and fmt.get("acodec") != "none":
+                audio_url = fmt.get("url")
+                if audio_url:
+                    break
+
+    if not audio_url:
+        for fmt in formats:
+            if fmt.get("acodec") != "none":
+                audio_url = fmt.get("url")
+                if audio_url:
+                    break
+
+    if not audio_url and formats:
+        audio_url = formats[0].get("url")
 
     if not audio_url:
         raise ValueError("No audio stream URL found")
@@ -194,17 +213,6 @@ def get_audio_stream(url: str) -> dict:
                     msg[:160],
                 )
                 continue
-            if (
-                not skip_cookies
-                and cookie_path
-                and "format is not available" in msg.casefold()
-            ):
-                logger.error(
-                    "[get_audio_stream] Cookie + web client failed format selection. "
-                    "Install a JS runtime for yt-dlp (EJS): "
-                    "https://github.com/yt-dlp/yt-dlp/wiki/EJS — "
-                    "or use the no-cookie path from a non-datacenter IP."
-                )
             logger.exception(f"[get_audio_stream] Error extracting audio: {e}")
             raise
 
@@ -382,6 +390,75 @@ def api_lyrics(
             "synced_lyrics": None,
             "detail": str(e),
         }
+
+
+@app.get("/api/stream")
+def api_stream(url: str = Query(..., description="YouTube or other video URL")):
+    """
+    Stream audio directly to the client by piping yt-dlp stdout.
+
+    Flutter's ExoPlayer hits this endpoint instead of a short-lived
+    googlevideo.com URL, so there are no 403 / cookie / IP issues.
+    """
+    raw_url = unquote(url)
+    logger.info("[API] /api/stream called for: %s", raw_url[:100])
+
+    cookie_path, cookie_source = _resolve_youtube_cookiefile()
+
+    command = [
+        "yt-dlp",
+        "-f", "bestaudio[ext=m4a]/bestaudio",
+        "--no-playlist",
+        "--no-part",
+        "--remote-components", "ejs:github",
+        "--extractor-args", "youtube:player_client=web",
+        "-o", "-",
+        "--quiet",
+    ]
+    if cookie_path:
+        command += ["--cookies", cookie_path]
+        logger.info("[API] /api/stream using cookiefile (%s)", cookie_source)
+
+    command.append(raw_url)
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="yt-dlp executable not found. Make sure it is installed and on PATH.",
+        )
+    except Exception as e:
+        logger.error("[API] /api/stream failed to start yt-dlp: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    def _iter_chunks(proc: subprocess.Popen, chunk_size: int = 64 * 1024):
+        try:
+            while True:
+                chunk = proc.stdout.read(chunk_size)
+                if not chunk:
+                    err = proc.stderr.read().decode(errors="replace")
+                    if err.strip():
+                        logger.error("[API] /api/stream yt-dlp stderr: %s", err)
+                    break
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+            logger.info("[API] /api/stream yt-dlp process finished (rc=%s)", proc.returncode)
+
+    return StreamingResponse(
+        _iter_chunks(process),
+        media_type="application/octet-stream",
+        headers={
+            "Accept-Ranges": "none",
+            "Content-Disposition": "inline",
+        },
+    )
 
 
 if __name__ == "__main__":
