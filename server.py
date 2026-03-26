@@ -98,17 +98,17 @@ def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
 def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
     resolved_path, resolved_source = _resolve_youtube_cookiefile()
 
+    # 🔥 KEY FIX: Always allow mobile clients FIRST
     if skip_cookiefile:
-        # ✅ NO cookies → allow mobile clients (best formats)
         cookies_path = None
         player_client = ["android", "ios", "web"]
-        logger.info("[yt-dlp] Using NO cookies (mobile clients enabled)")
+        logger.info("[yt-dlp] Using NO cookies (mobile clients)")
     else:
-        # ✅ WITH cookies → ONLY web client (important!)
         cookies_path = resolved_path
-        player_client = ["web"]
+        # 🔥 IMPORTANT: include mobile even WITH cookies
+        player_client = ["android", "ios", "web"]
         if cookies_path:
-            logger.info("[yt-dlp] Using cookies (web client only)")
+            logger.info("[yt-dlp] Using cookies + mobile clients")
 
     opts: dict = {
         "format": "best",
@@ -414,94 +414,73 @@ _EXT_TO_MIME: dict[str, str] = {
 
 
 def _pick_best_stream_format(url: str) -> tuple[str, str]:
-    """
-    Use yt-dlp Python API to inspect available formats and return
-    (format_id, mime_type) for the best audio-only stream.
-
-    Priority (audio-only only — no video tracks):
-      1. m4a  (AAC)  — best mobile compatibility
-      2. webm (Opus) — high quality fallback
-      3. Any remaining audio-only format by bitrate
-    Falls back to ("bestaudio", "audio/mp4") if detection fails.
-    """
     cookie_path, cookie_source = _resolve_youtube_cookiefile()
-    opts: dict = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "extractor_args": {
-            "youtube": {"player_client": ["web"]},
-        },
-    }
-    if cookie_path:
-        opts["cookiefile"] = cookie_path
-        logger.info("[stream-fmt] Using cookiefile (%s)", cookie_source)
 
-    try:
+    def extract_with_clients(clients, use_cookies):
+        opts: dict = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extractor_args": {
+                "youtube": {"player_client": clients},
+            },
+        }
+        if use_cookies and cookie_path:
+            opts["cookiefile"] = cookie_path
+
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            return ydl.extract_info(url, download=False)
 
-        if not info:
-            logger.warning("[stream-fmt] No info returned — falling back to bestaudio")
-            return "bestaudio", "audio/mp4"
+    info = None
 
-        formats = info.get("formats", [])
-
-        # Keep only pure audio-only formats (no video track at all)
-        audio_only = [
-            f for f in formats
-            if f.get("vcodec") in (None, "none")
-            and f.get("acodec") not in (None, "none")
-            and f.get("url")
-        ]
-
-        logger.info(
-            "[stream-fmt] Audio-only formats available: %s",
-            [
-                f"{f.get('format_id')} ({f.get('ext')}, {f.get('abr') or f.get('tbr', '?')} kbps)"
-                for f in audio_only
-            ],
-        )
-
-        if not audio_only:
-            logger.warning("[stream-fmt] No audio-only formats found — falling back to bestaudio")
-            return "bestaudio", "audio/mp4"
-
-        # 1. Best m4a (AAC) — most compatible with Android ExoPlayer / iOS
-        m4a = [f for f in audio_only if f.get("ext") == "m4a"]
-        if m4a:
-            best = max(m4a, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-            logger.info(
-                "[stream-fmt] ✔ Selected m4a (AAC) → format_id=%s  abr=%s kbps",
-                best["format_id"], best.get("abr"),
-            )
-            return best["format_id"], "audio/mp4"
-
-        # 2. Best webm (Opus)
-        webm = [f for f in audio_only if f.get("ext") == "webm"]
-        if webm:
-            best = max(webm, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-            logger.info(
-                "[stream-fmt] ✔ Selected webm (Opus) → format_id=%s  abr=%s kbps",
-                best["format_id"], best.get("abr"),
-            )
-            return best["format_id"], "audio/webm"
-
-        # 3. Best of whatever is left
-        best = max(audio_only, key=lambda f: f.get("abr") or f.get("tbr") or 0)
-        ext = best.get("ext", "")
-        mime = _EXT_TO_MIME.get(ext, "audio/mp4")
-        logger.info(
-            "[stream-fmt] ✔ Selected best audio → format_id=%s  ext=%s  abr=%s kbps  mime=%s",
-            best["format_id"], ext, best.get("abr"), mime,
-        )
-        return best["format_id"], mime
-
+    # 🔥 TRY 1: MOBILE (MOST IMPORTANT — works on Render)
+    try:
+        logger.info("[stream-fmt] Trying mobile clients (no cookies)")
+        info = extract_with_clients(["android", "ios"], False)
     except Exception as e:
-        logger.warning("[stream-fmt] Format detection failed (%s) — using bestaudio", e)
+        logger.warning(f"[stream-fmt] Mobile failed: {e}")
+
+    # 🔥 TRY 2: WEB + COOKIES
+    if not info and cookie_path:
+        try:
+            logger.info("[stream-fmt] Trying web + cookies")
+            info = extract_with_clients(["web"], True)
+        except Exception as e:
+            logger.warning(f"[stream-fmt] Web+cookies failed: {e}")
+
+    if not info:
+        logger.warning("[stream-fmt] All extraction failed → fallback bestaudio")
         return "bestaudio", "audio/mp4"
 
+    formats = info.get("formats", [])
+
+    audio_only = [
+        f for f in formats
+        if f.get("vcodec") in (None, "none")
+        and f.get("acodec") not in (None, "none")
+        and f.get("url")
+    ]
+
+    logger.info(f"[stream-fmt] Found {len(audio_only)} audio formats")
+
+    if not audio_only:
+        return "bestaudio", "audio/mp4"
+
+    # prefer m4a
+    m4a = [f for f in audio_only if f.get("ext") == "m4a"]
+    if m4a:
+        best = max(m4a, key=lambda f: f.get("abr") or 0)
+        return best["format_id"], "audio/mp4"
+
+    # fallback webm
+    webm = [f for f in audio_only if f.get("ext") == "webm"]
+    if webm:
+        best = max(webm, key=lambda f: f.get("abr") or 0)
+        return best["format_id"], "audio/webm"
+
+    best = max(audio_only, key=lambda f: f.get("abr") or 0)
+    return best["format_id"], "audio/mp4"
 
 @app.get("/api/stream")
 def api_stream(url: str = Query(..., description="YouTube or other video URL")):
