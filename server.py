@@ -110,8 +110,9 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
         if cookies_path:
             logger.info("[yt-dlp] Using cookies + mobile clients")
 
+    # Prefer audio-only; "best" can fail on some restricted/odd manifests.
     opts: dict = {
-        "format": "best",
+        "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -451,7 +452,8 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
 
     if not info:
         logger.warning("[stream-fmt] All extraction failed → fallback bestaudio")
-        return "bestaudio", "audio/mp4"
+        # We don't know the container/codec if extraction failed; avoid lying about MIME type.
+        return "bestaudio", "application/octet-stream"
 
     formats = info.get("formats", [])
 
@@ -465,7 +467,7 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
     logger.info(f"[stream-fmt] Found {len(audio_only)} audio formats")
 
     if not audio_only:
-        return "bestaudio", "audio/mp4"
+        return "bestaudio", "application/octet-stream"
 
     # prefer m4a
     m4a = [f for f in audio_only if f.get("ext") == "m4a"]
@@ -480,7 +482,9 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
         return best["format_id"], "audio/webm"
 
     best = max(audio_only, key=lambda f: f.get("abr") or 0)
-    return best["format_id"], "audio/mp4"
+    # Unknown ext: keep a safe content-type.
+    ext = str(best.get("ext") or "").lower()
+    return best["format_id"], _EXT_TO_MIME.get(ext, "application/octet-stream")
 
 @app.get("/api/stream")
 def api_stream(url: str = Query(..., description="YouTube or other video URL")):
@@ -499,9 +503,13 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
 
     cookie_path, cookie_source = _resolve_youtube_cookiefile()
 
+    # If a specific format_id is picked, keep it but add robust fallbacks.
+    # If extraction failed, `format_id` may be "bestaudio" already.
+    format_selector = f"{format_id}/bestaudio/best"
+
     command = [
         "yt-dlp",
-        "-f", format_id,
+        "-f", format_selector,
         "--no-playlist",
         "--no-part",
         "-o", "-",
@@ -528,8 +536,21 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
         logger.error("[API] /api/stream failed to start yt-dlp: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    def _iter_chunks(proc: subprocess.Popen, chunk_size: int = 64 * 1024):
+    # Preflight: if yt-dlp exits immediately, return a 500 instead of a silent empty 200.
+    try:
+        first_chunk = process.stdout.read(64 * 1024)
+    except Exception as e:
+        err = (process.stderr.read() or b"").decode(errors="replace")
+        raise HTTPException(status_code=500, detail=f"Stream preflight failed: {e}; {err}".strip())
+
+    if not first_chunk:
+        err = (process.stderr.read() or b"").decode(errors="replace")
+        detail = err.strip() or "yt-dlp produced no audio data"
+        raise HTTPException(status_code=500, detail=detail[:2000])
+
+    def _iter_chunks(proc: subprocess.Popen, first: bytes, chunk_size: int = 64 * 1024):
         try:
+            yield first
             while True:
                 chunk = proc.stdout.read(chunk_size)
                 if not chunk:
@@ -544,11 +565,13 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
             logger.info("[API] /api/stream yt-dlp process finished (rc=%s)", proc.returncode)
 
     return StreamingResponse(
-        _iter_chunks(process),
+        _iter_chunks(process, first_chunk),
         media_type=mime_type,
         headers={
-            "Accept-Ranges": "none",
             "Content-Disposition": "inline",
+            # Hint reverse proxies (nginx) not to buffer this response.
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-store",
         },
     )
 
