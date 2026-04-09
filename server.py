@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -513,13 +514,18 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
     format_selector = f"{format_id}/bestaudio/best"
 
     command = [
-        "yt-dlp",
+        # Use the same venv Python environment as the API (so yt-dlp-ejs is available).
+        sys.executable,
+        "-m",
+        "yt_dlp",
         "-f", format_selector,
         "--no-playlist",
         "--no-part",
         "-o", "-",
         "--quiet",
         "--js-runtimes", "node",
+        # Required on some VPS IPs to solve YouTube JS challenges.
+        "--remote-components", "ejs:github",
     ]
     if cookie_path:
         command += ["--cookies", cookie_path]
