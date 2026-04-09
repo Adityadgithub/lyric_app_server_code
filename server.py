@@ -119,7 +119,8 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
         "noplaylist": True,
         # Use Node.js for YouTube's JS challenges/signature solving (VPS/datacenter IPs).
         # Mirrors CLI: `yt-dlp --js-runtimes node ...`
-        "js_runtimes": ["node"],
+        # Python API expects a dict: {runtime: {config}}
+        "js_runtimes": {"node": {}},
         "extractor_args": {
             "youtube": {
                 "player_client": player_client,
@@ -426,7 +427,7 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
             "no_warnings": True,
             "skip_download": True,
             "noplaylist": True,
-            "js_runtimes": ["node"],
+            "js_runtimes": {"node": {}},
             "extractor_args": {
                 "youtube": {"player_client": clients},
             },
