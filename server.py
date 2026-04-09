@@ -458,8 +458,9 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
 
     if not info:
         logger.warning("[stream-fmt] All extraction failed → fallback bestaudio")
-        # We don't know the container/codec if extraction failed; avoid lying about MIME type.
-        return "bestaudio", "application/octet-stream"
+        # If extraction fails (common on VPS IPs), prefer m4a if available at download time.
+        # Returning a concrete audio MIME improves browser/player compatibility vs octet-stream.
+        return "140", "audio/mp4"
 
     formats = info.get("formats", [])
 
@@ -473,7 +474,7 @@ def _pick_best_stream_format(url: str) -> tuple[str, str]:
     logger.info(f"[stream-fmt] Found {len(audio_only)} audio formats")
 
     if not audio_only:
-        return "bestaudio", "application/octet-stream"
+        return "140", "audio/mp4"
 
     # prefer m4a
     m4a = [f for f in audio_only if f.get("ext") == "m4a"]
@@ -509,9 +510,9 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
 
     cookie_path, cookie_source = _resolve_youtube_cookiefile()
 
-    # If a specific format_id is picked, keep it but add robust fallbacks.
-    # If extraction failed, `format_id` may be "bestaudio" already.
-    format_selector = f"{format_id}/bestaudio/best"
+    # Prefer the picked format_id, then m4a (140), then generic audio fallbacks.
+    # m4a tends to be the most widely playable container across browsers/players.
+    format_selector = f"{format_id}/140/bestaudio/best"
 
     command = [
         # Use the same venv Python environment as the API (so yt-dlp-ejs is available).
@@ -584,6 +585,8 @@ def api_stream(url: str = Query(..., description="YouTube or other video URL")):
             # Hint reverse proxies (nginx) not to buffer this response.
             "X-Accel-Buffering": "no",
             "Cache-Control": "no-store",
+            # Some clients check this for streaming media.
+            "Accept-Ranges": "none",
         },
     )
 
