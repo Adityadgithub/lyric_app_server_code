@@ -1,22 +1,30 @@
 
 """
 FastAPI server that:
-- extracts audio stream URLs from YouTube/other video links using yt-dlp
+- downloads audio files from YouTube/other video links using yt-dlp (queued + cached)
 - optionally fetches synced lyrics from YouTube Music (ytmusicapi)
 """
+import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
 import shutil
 import sys
+import time
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote, urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import subprocess
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 import yt_dlp
 from yt_dlp.utils import DownloadError
 from ytmusicapi import YTMusic
@@ -41,11 +49,387 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def log_request_url(request: Request, call_next):
+    logger.info("[API] %s %s", request.method, request.url)
+    return await call_next(request)
+
+
+@app.on_event("startup")
+async def _startup_download_gc():
+    async def _loop():
+        while True:
+            try:
+                _purge_expired_downloads()
+            except Exception as e:
+                logger.warning("[downloads] GC error: %s", e)
+            await asyncio.sleep(60)
+
+    asyncio.create_task(_loop())
+
+
 # Global YTMusic client (unauthenticated; uses public endpoints)
 ytmusic_client = YTMusic()
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _DEFAULT_COOKIES_FILE = _BACKEND_DIR / "cookies.txt"
+
+_DOWNLOAD_DIR = Path(
+    os.environ.get("AUDIO_DOWNLOAD_DIR", str(_BACKEND_DIR / "downloads"))
+).resolve()
+_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+_MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("AUDIO_MAX_CONCURRENT_DOWNLOADS", "3"))
+_DOWNLOAD_TTL_SECONDS = int(os.environ.get("AUDIO_DOWNLOAD_TTL_SECONDS", str(60 * 60)))
+_RATE_LIMIT_PER_HOUR = int(os.environ.get("AUDIO_RATE_LIMIT_PER_HOUR", "5"))
+
+_NEWPIPE_EXTRACTOR_URL = os.environ.get("NEWPIPE_EXTRACTOR_URL", "").strip().rstrip("/")
+_NEWPIPE_EXTRACTOR_TIMEOUT = float(os.environ.get("NEWPIPE_EXTRACTOR_TIMEOUT_SECONDS", "25"))
+
+_download_executor = ThreadPoolExecutor(
+    max_workers=max(1, _MAX_CONCURRENT_DOWNLOADS),
+    thread_name_prefix="audio_dl",
+)
+_download_semaphore = asyncio.Semaphore(max(1, _MAX_CONCURRENT_DOWNLOADS))
+_download_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_rate_buckets: dict[str, deque[float]] = defaultdict(deque)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+def _enforce_rate_limit(client_ip: str) -> None:
+    now = time.time()
+    window_start = now - 3600.0
+    bucket = _rate_buckets[client_ip]
+    while bucket and bucket[0] < window_start:
+        bucket.popleft()
+    if len(bucket) >= _RATE_LIMIT_PER_HOUR:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: max {_RATE_LIMIT_PER_HOUR} downloads/hour",
+        )
+    bucket.append(now)
+
+
+def _purge_expired_downloads() -> None:
+    now = time.time()
+    try:
+        for path in _DOWNLOAD_DIR.iterdir():
+            if not path.is_file():
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age > _DOWNLOAD_TTL_SECONDS:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        return
+
+
+def _cache_key_for_url(raw_url: str) -> str:
+    return hashlib.sha256(raw_url.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _newpipe_resolve_json(raw_url: str) -> dict:
+    if not _NEWPIPE_EXTRACTOR_URL:
+        raise RuntimeError("NEWPIPE_EXTRACTOR_URL is not configured")
+
+    endpoint = f"{_NEWPIPE_EXTRACTOR_URL}/v1/resolve_audio?url={quote(raw_url, safe='')}"
+    req = Request(endpoint, method="GET", headers={"Accept": "application/json"})
+
+    with urlopen(req, timeout=_NEWPIPE_EXTRACTOR_TIMEOUT) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+
+    data = json.loads(body)
+    if not isinstance(data, dict):
+        raise RuntimeError("NewPipe sidecar returned non-object JSON")
+    if not data.get("success"):
+        raise RuntimeError(str(data.get("error") or "NewPipe sidecar reported failure"))
+
+    audio_url = data.get("audio_url")
+    if not audio_url or not isinstance(audio_url, str):
+        raise RuntimeError("NewPipe sidecar response missing audio_url")
+
+    return data
+
+
+def _guess_ext_from_mime(mime: str | None) -> str | None:
+    if not mime:
+        return None
+    m = mime.split(";", 1)[0].strip().lower()
+    return {
+        "audio/mp4": ".m4a",
+        "audio/mpeg": ".mp3",
+        "audio/webm": ".webm",
+        "audio/ogg": ".ogg",
+        "audio/opus": ".opus",
+        "audio/aac": ".aac",
+        "audio/flac": ".flac",
+        "audio/wav": ".wav",
+    }.get(m)
+
+
+def _guess_ext_from_url(audio_url: str) -> str | None:
+    lower = audio_url.lower()
+    if "mime=audio%2Fmp4" in lower or "mime=audio/mp4" in lower:
+        return ".m4a"
+    if "mime=audio%2Fwebm" in lower or "mime=audio/webm" in lower:
+        return ".webm"
+    if "mime=audio%2Fmpeg" in lower or "mime=audio/mpeg" in lower:
+        return ".mp3"
+    return None
+
+
+def _http_download_to_file(*, audio_url: str, out_path: Path, timeout: float) -> tuple[str, str]:
+    """
+    Download bytes to disk. Returns (ext_without_dot, media_type).
+    """
+    # YouTube CDN URLs are picky; a browser-ish UA + Referer helps a lot.
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "close",
+    }
+
+    host = urlsplit(audio_url).netloc.lower()
+    if "googlevideo.com" in host or "youtube.com" in host or "youtu.be" in host:
+        headers["Referer"] = "https://www.youtube.com/"
+        headers["Origin"] = "https://www.youtube.com"
+
+    req = Request(audio_url, method="GET", headers=headers)
+    with urlopen(req, timeout=timeout) as resp:
+        content_type = (resp.headers.get("Content-Type") or "").split(";", 1)[0].strip()
+        data = resp.read()
+
+    ext = _guess_ext_from_mime(content_type) or _guess_ext_from_url(audio_url) or ".bin"
+    media = {
+        "m4a": "audio/mp4",
+        "mp3": "audio/mpeg",
+        "webm": "audio/webm",
+        "opus": "audio/ogg",
+        "ogg": "audio/ogg",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+    }.get(ext.lstrip("."), content_type or "application/octet-stream")
+
+    out_path.write_bytes(data)
+    return ext.lstrip("."), media
+
+
+def _try_newpipe_http_download_to_cache(raw_url: str, cache_key: str) -> tuple[str, str, str] | None:
+    if not _NEWPIPE_EXTRACTOR_URL:
+        return None
+
+    try:
+        np = _newpipe_resolve_json(raw_url)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as e:
+        logger.warning("[newpipe] resolve failed: %s", e)
+        return None
+
+    audio_url = str(np.get("audio_url") or "")
+    if not audio_url:
+        return None
+
+    mime_hint = str(np.get("mime_type") or "")
+    ext_from_np = _guess_ext_from_mime(mime_hint) or _guess_ext_from_url(audio_url) or ".bin"
+    out_path = _DOWNLOAD_DIR / f"{cache_key}{ext_from_np}"
+
+    try:
+        ext, media = _http_download_to_file(
+            audio_url=audio_url,
+            out_path=out_path,
+            timeout=max(_NEWPIPE_EXTRACTOR_TIMEOUT, 60.0),
+        )
+    except (HTTPError, URLError, TimeoutError) as e:
+        logger.warning("[newpipe] http download failed: %s", e)
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    final_suffix = f".{ext}" if ext else out_path.suffix
+    final_path = _DOWNLOAD_DIR / f"{cache_key}{final_suffix}"
+    if final_path.resolve() != out_path.resolve():
+        try:
+            final_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            out_path.replace(final_path)
+        except OSError:
+            # If rename fails, keep original path but note mismatch in logs.
+            final_path = out_path
+
+    logger.info(
+        "[newpipe] downloaded via sidecar ext=%s media=%s title=%r uploader=%r itag=%s delivery=%r",
+        ext,
+        media,
+        np.get("title"),
+        np.get("uploader"),
+        np.get("itag"),
+        np.get("delivery_method"),
+    )
+
+    meta = {
+        "cache_key": cache_key,
+        "source_url": raw_url,
+        "path": str(final_path),
+        "ext": ext,
+        "media_type": media,
+        "created_at": time.time(),
+        "source": "newpipe_extractor",
+        "newpipe": {k: np.get(k) for k in ("title", "uploader", "duration", "itag", "codec", "bitrate", "mime_type", "delivery_method")},
+    }
+    (_DOWNLOAD_DIR / f"{cache_key}.meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    return f"{cache_key}{final_path.suffix}", final_path.name, media
+
+
+def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
+    """
+    Returns (file_id, filename_on_disk, media_type).
+    """
+    cache_key = _cache_key_for_url(raw_url)
+
+    if _NEWPIPE_EXTRACTOR_URL:
+        fast = _try_newpipe_http_download_to_cache(raw_url, cache_key)
+        if fast:
+            return fast
+
+    out_template = str(_DOWNLOAD_DIR / f"{cache_key}.%(ext)s")
+
+    command = [
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "-f",
+        "bestaudio/best",
+        "--no-playlist",
+        "--no-warnings",
+        "--no-part",
+        "-o",
+        out_template,
+        "--quiet",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        raw_url,
+    ]
+
+    proc = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(err or f"yt-dlp failed (rc={proc.returncode})")
+
+    candidates = sorted(
+        _DOWNLOAD_DIR.glob(f"{cache_key}.*"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+    if not candidates:
+        raise RuntimeError("yt-dlp finished but no output file was found")
+
+    chosen = candidates[0]
+    ext = chosen.suffix.lower().lstrip(".")
+    media = {
+        "m4a": "audio/mp4",
+        "mp3": "audio/mpeg",
+        "webm": "audio/webm",
+        "opus": "audio/ogg",
+        "ogg": "audio/ogg",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+    }.get(ext, "application/octet-stream")
+
+    file_id = f"{cache_key}{chosen.suffix}"
+    meta = {
+        "cache_key": cache_key,
+        "source_url": raw_url,
+        "path": str(chosen),
+        "ext": ext,
+        "media_type": media,
+        "created_at": time.time(),
+        "source": "yt_dlp",
+    }
+    meta_path = _DOWNLOAD_DIR / f"{cache_key}.meta.json"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    return file_id, chosen.name, media
+
+
+async def _ensure_downloaded(raw_url: str, *, rate_limit_key: str | None = None) -> tuple[str, str, str]:
+    """
+    Queue + cache wrapper around synchronous yt-dlp download.
+    """
+    cache_key = _cache_key_for_url(raw_url)
+    lock = _download_locks[cache_key]
+
+    async with lock:
+        existing = sorted(
+            _DOWNLOAD_DIR.glob(f"{cache_key}.*"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0,
+            reverse=True,
+        )
+        for p in existing:
+            if p.suffix.lower() == ".json":
+                continue
+            if p.is_file():
+                age = time.time() - p.stat().st_mtime
+                if age <= _DOWNLOAD_TTL_SECONDS:
+                    ext = p.suffix.lower().lstrip(".")
+                    media = {
+                        "m4a": "audio/mp4",
+                        "mp3": "audio/mpeg",
+                        "webm": "audio/webm",
+                        "opus": "audio/ogg",
+                        "ogg": "audio/ogg",
+                        "aac": "audio/aac",
+                        "flac": "audio/flac",
+                        "wav": "audio/wav",
+                    }.get(ext, "application/octet-stream")
+                    logger.info(
+                        "[downloads] cache hit cache_key=%s file=%s",
+                        cache_key,
+                        p.name,
+                    )
+                    return f"{cache_key}{p.suffix}", p.name, media
+
+        # Only enforce the per-IP hourly cap when we are about to spend real work
+        # (yt-dlp / network download). Cached responses should not consume quota.
+        if rate_limit_key is not None:
+            _enforce_rate_limit(rate_limit_key)
+
+        async with _download_semaphore:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                _download_executor,
+                lambda: _download_audio_file_sync(raw_url),
+            )
 
 
 def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
@@ -139,37 +523,44 @@ def _info_dict_to_stream_result(info: dict) -> dict:
     """Pick a playable URL from yt-dlp format entries (avoid relying on top-level url)."""
     formats = info.get("formats", [])
 
-    audio_url = None
+    selected_fmt = None
+    preferred_format_ids = ["140", "251", "250", "249"]
 
-    preferred_itags = [251, 250, 249, 140]
-
-    for itag in preferred_itags:
+    for format_id in preferred_format_ids:
         for fmt in formats:
-            if fmt.get("itag") == itag and fmt.get("url"):
-                audio_url = fmt["url"]
+            if str(fmt.get("format_id") or fmt.get("itag") or "") == format_id and fmt.get("url"):
+                selected_fmt = fmt
                 break
-        if audio_url:
+        if selected_fmt:
             break
 
-    if not audio_url:
-        for fmt in formats:
-            if fmt.get("vcodec") == "none" and fmt.get("acodec") != "none":
-                audio_url = fmt.get("url")
-                if audio_url:
-                    break
+    if not selected_fmt:
+        audio_only = [
+            fmt for fmt in formats
+            if fmt.get("url")
+            and fmt.get("vcodec") in (None, "none")
+            and fmt.get("acodec") not in (None, "none")
+        ]
 
-    if not audio_url:
-        for fmt in formats:
-            if fmt.get("acodec") != "none":
-                audio_url = fmt.get("url")
-                if audio_url:
-                    break
+        if audio_only:
+            m4a = [fmt for fmt in audio_only if str(fmt.get("ext") or "").lower() == "m4a"]
+            webm = [fmt for fmt in audio_only if str(fmt.get("ext") or "").lower() == "webm"]
 
-    if not audio_url and formats:
-        audio_url = formats[0].get("url")
+            pool = m4a or webm or audio_only
+            selected_fmt = max(pool, key=lambda fmt: fmt.get("abr") or 0)
 
+    audio_url = selected_fmt.get("url") if selected_fmt else None
     if not audio_url:
-        raise ValueError("No audio stream URL found")
+        raise ValueError("No audio-only stream URL found")
+
+    if selected_fmt.get("vcodec") not in (None, "none") or selected_fmt.get("acodec") in (None, "none"):
+        raise ValueError(
+            "Rejected non-audio-only format: "
+            f"format_id={selected_fmt.get('format_id')} "
+            f"itag={selected_fmt.get('itag')} "
+            f"vcodec={selected_fmt.get('vcodec')} "
+            f"acodec={selected_fmt.get('acodec')}"
+        )
 
     title = info.get("title") or "Unknown"
     artist = info.get("uploader") or info.get("artist") or "Unknown"
@@ -177,6 +568,52 @@ def _info_dict_to_stream_result(info: dict) -> dict:
 
     logger.info(f"[get_audio_stream] Success! Title: {title}, Artist: {artist}")
     logger.info(f"[get_audio_stream] Audio URL (truncated): {audio_url[:80]}...")
+    logger.info(
+        "[get_audio_stream] Selected format: format_id=%s itag=%s ext=%s acodec=%s vcodec=%s abr=%s",
+        selected_fmt.get("format_id") if selected_fmt else None,
+        selected_fmt.get("itag") if selected_fmt else None,
+        selected_fmt.get("ext") if selected_fmt else None,
+        selected_fmt.get("acodec") if selected_fmt else None,
+        selected_fmt.get("vcodec") if selected_fmt else None,
+        selected_fmt.get("abr") if selected_fmt else None,
+    )
+
+    return {
+        "audio_url": audio_url,
+        "title": title,
+        "artist": artist,
+        "duration": duration,
+    }
+
+
+def _newpipe_dict_to_stream_result(np: dict) -> dict:
+    audio_url = str(np.get("audio_url") or "")
+    if not audio_url:
+        raise ValueError("NewPipe sidecar returned empty audio_url")
+
+    mime = str(np.get("mime_type") or "").lower()
+    if mime.startswith("video/"):
+        raise ValueError(f"Rejected NewPipe muxed/video mime_type={mime!r}")
+
+    lower_url = audio_url.lower()
+    if lower_url.endswith(".m3u8") or "manifest" in lower_url:
+        # ExoPlayer may handle these, but the app stack is much simpler with progressive/DASH audio files.
+        raise ValueError("Rejected NewPipe HLS/manifest-style audio_url")
+
+    title = str(np.get("title") or "Unknown")
+    artist = str(np.get("uploader") or "Unknown")
+    duration = np.get("duration")
+
+    logger.info("[get_audio_stream][newpipe] Success! Title: %s, Artist: %s", title, artist)
+    logger.info("[get_audio_stream][newpipe] Audio URL (truncated): %s...", audio_url[:80])
+    logger.info(
+        "[get_audio_stream][newpipe] Selected stream: itag=%s codec=%s abr=%s mime=%s delivery=%s",
+        np.get("itag"),
+        np.get("codec"),
+        np.get("bitrate"),
+        np.get("mime_type"),
+        np.get("delivery_method"),
+    )
 
     return {
         "audio_url": audio_url,
@@ -187,8 +624,15 @@ def _info_dict_to_stream_result(info: dict) -> dict:
 
 
 def get_audio_stream(url: str) -> dict:
-    """Extract audio stream URL and metadata using yt-dlp."""
+    """Extract audio stream URL and metadata (NewPipe sidecar first, then yt-dlp)."""
     logger.info(f"[get_audio_stream] Input URL: {url}")
+
+    if _NEWPIPE_EXTRACTOR_URL:
+        try:
+            np = _newpipe_resolve_json(url)
+            return _newpipe_dict_to_stream_result(np)
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError, ValueError) as e:
+            logger.warning("[get_audio_stream] NewPipe sidecar failed; falling back to yt-dlp: %s", e)
 
     cookie_path, _ = _resolve_youtube_cookiefile()
     phases: list[tuple[bool, str]] = []
@@ -362,9 +806,11 @@ def api_audio(url: str = Query(..., description="YouTube or other video URL")):
     try:
         result = get_audio_stream(raw_url)
         logger.info(f"[API] Returning audio stream for: {result.get('title', '?')}")
+        logger.info("[API] /api/audio response: status=200 success=True")
         return {"success": True, **result}
     except Exception as e:
         logger.error(f"[API] Failed to get audio: {e}")
+        logger.error("[API] /api/audio response: status=500 success=False detail=%s", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -385,6 +831,7 @@ def api_lyrics(
         synced = get_ytmusic_synced_lyrics(title, artist)
         if not synced:
             logger.info("[API] /api/lyrics: no synced lyrics available from YouTube Music")
+            logger.info("[API] /api/lyrics response: status=200 success=False (no synced lyrics)")
             # 200 with success=False so frontend can decide final fallback
             return {
                 "success": False,
@@ -393,12 +840,14 @@ def api_lyrics(
             }
 
         logger.info("[API] /api/lyrics: returning synced lyrics from YouTube Music")
+        logger.info("[API] /api/lyrics response: status=200 success=True")
         return {
             "success": True,
             "synced_lyrics": synced,
         }
     except Exception as e:
         logger.error(f"[API] /api/lyrics failed: {e}")
+        logger.error("[API] /api/lyrics response: status=200 success=False detail=%s", str(e))
         # Do not hard-fail the app; just indicate failure
         return {
             "success": False,
@@ -419,176 +868,66 @@ _EXT_TO_MIME: dict[str, str] = {
 }
 
 
-def _pick_best_stream_format(url: str) -> tuple[str, str]:
-    cookie_path, cookie_source = _resolve_youtube_cookiefile()
-
-    def extract_with_clients(clients, use_cookies):
-        opts: dict = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": True,
-            "js_runtimes": {"node": {}},
-            "extractor_args": {
-                "youtube": {"player_client": clients},
-            },
-        }
-        if use_cookies and cookie_path:
-            opts["cookiefile"] = cookie_path
-
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    info = None
-
-    # 🔥 TRY 1: MOBILE (MOST IMPORTANT — works on Render)
-    try:
-        logger.info("[stream-fmt] Trying mobile clients (no cookies)")
-        info = extract_with_clients(["android", "ios"], False)
-    except Exception as e:
-        logger.warning(f"[stream-fmt] Mobile failed: {e}")
-
-    # 🔥 TRY 2: WEB + COOKIES
-    if not info and cookie_path:
-        try:
-            logger.info("[stream-fmt] Trying web + cookies")
-            info = extract_with_clients(["web"], True)
-        except Exception as e:
-            logger.warning(f"[stream-fmt] Web+cookies failed: {e}")
-
-    if not info:
-        logger.warning("[stream-fmt] All extraction failed → fallback bestaudio")
-        # If extraction fails (common on VPS IPs), prefer m4a if available at download time.
-        # Returning a concrete audio MIME improves browser/player compatibility vs octet-stream.
-        return "140", "audio/mp4"
-
-    formats = info.get("formats", [])
-
-    audio_only = [
-        f for f in formats
-        if f.get("vcodec") in (None, "none")
-        and f.get("acodec") not in (None, "none")
-        and f.get("url")
-    ]
-
-    logger.info(f"[stream-fmt] Found {len(audio_only)} audio formats")
-
-    if not audio_only:
-        return "140", "audio/mp4"
-
-    # prefer m4a
-    m4a = [f for f in audio_only if f.get("ext") == "m4a"]
-    if m4a:
-        best = max(m4a, key=lambda f: f.get("abr") or 0)
-        return best["format_id"], "audio/mp4"
-
-    # fallback webm
-    webm = [f for f in audio_only if f.get("ext") == "webm"]
-    if webm:
-        best = max(webm, key=lambda f: f.get("abr") or 0)
-        return best["format_id"], "audio/webm"
-
-    best = max(audio_only, key=lambda f: f.get("abr") or 0)
-    # Unknown ext: keep a safe content-type.
-    ext = str(best.get("ext") or "").lower()
-    return best["format_id"], _EXT_TO_MIME.get(ext, "application/octet-stream")
-
-@app.get("/api/stream")
-def api_stream(url: str = Query(..., description="YouTube or other video URL")):
-    """
-    Stream audio directly to the client by piping yt-dlp stdout.
-
-    Flutter's ExoPlayer hits this endpoint instead of a short-lived
-    googlevideo.com URL, so there are no 403 / cookie / IP issues.
-    """
+async def _download_handler(request: Request, url: str) -> dict:
     raw_url = unquote(url)
-    logger.info("[API] /api/stream called for: %s", raw_url[:100])
+    client_ip = _client_ip(request)
 
-    # Detect the best available audio-only format before spawning the subprocess
-    format_id, mime_type = _pick_best_stream_format(raw_url)
-    logger.info("[API] /api/stream → format_id=%s  mime=%s", format_id, mime_type)
-
-    cookie_path, cookie_source = _resolve_youtube_cookiefile()
-
-    # Prefer the picked format_id, then m4a (140), then generic audio fallbacks.
-    # m4a tends to be the most widely playable container across browsers/players.
-    format_selector = f"{format_id}/140/bestaudio/best"
-
-    command = [
-        # Use the same venv Python environment as the API (so yt-dlp-ejs is available).
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "-f", format_selector,
-        "--no-playlist",
-        "--no-part",
-        "-o", "-",
-        "--quiet",
-        "--js-runtimes", "node",
-        # Required on some VPS IPs to solve YouTube JS challenges.
-        "--remote-components", "ejs:github",
-    ]
-    if cookie_path:
-        command += ["--cookies", cookie_path]
-        logger.info("[API] /api/stream using cookiefile (%s)", cookie_source)
-
-    command.append(raw_url)
-
+    logger.info("[downloads] queued download for ip=%s url=%s", client_ip, raw_url[:120])
     try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        file_id, filename, media_type = await _ensure_downloaded(
+            raw_url,
+            rate_limit_key=client_ip,
         )
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=500,
-            detail="yt-dlp executable not found. Make sure it is installed and on PATH.",
-        )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("[API] /api/stream failed to start yt-dlp: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("[downloads] download failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
-    # Preflight: if yt-dlp exits immediately, return a 500 instead of a silent empty 200.
-    try:
-        first_chunk = process.stdout.read(64 * 1024)
-    except Exception as e:
-        err = (process.stderr.read() or b"").decode(errors="replace")
-        raise HTTPException(status_code=500, detail=f"Stream preflight failed: {e}; {err}".strip())
-
-    if not first_chunk:
-        err = (process.stderr.read() or b"").decode(errors="replace")
-        detail = err.strip() or "yt-dlp produced no audio data"
-        raise HTTPException(status_code=500, detail=detail[:2000])
-
-    def _iter_chunks(proc: subprocess.Popen, first: bytes, chunk_size: int = 64 * 1024):
-        try:
-            yield first
-            while True:
-                chunk = proc.stdout.read(chunk_size)
-                if not chunk:
-                    err = proc.stderr.read().decode(errors="replace")
-                    if err.strip():
-                        logger.error("[API] /api/stream yt-dlp stderr: %s", err)
-                    break
-                yield chunk
-        finally:
-            proc.stdout.close()
-            proc.wait()
-            logger.info("[API] /api/stream yt-dlp process finished (rc=%s)", proc.returncode)
-
-    return StreamingResponse(
-        _iter_chunks(process, first_chunk),
-        media_type=mime_type,
-        headers={
-            "Content-Disposition": "inline",
-            # Hint reverse proxies (nginx) not to buffer this response.
-            "X-Accel-Buffering": "no",
-            "Cache-Control": "no-store",
-            # Some clients check this for streaming media.
-            "Accept-Ranges": "none",
-        },
+    base = str(request.base_url).rstrip("/")
+    file_url = f"{base}/get_file/{file_id}"
+    logger.info(
+        "[downloads] ready file_id=%s filename=%s media_type=%s",
+        file_id,
+        filename,
+        media_type,
     )
+    return {
+        "success": True,
+        "file_id": file_id,
+        "filename": filename,
+        "media_type": media_type,
+        "file_url": file_url,
+        "source_url": raw_url,
+    }
+
+
+@app.get("/api/download")
+async def api_download(request: Request, url: str = Query(..., description="YouTube or other video URL")):
+    return await _download_handler(request, url)
+
+
+@app.get("/download")
+async def download_alias(request: Request, url: str = Query(..., description="YouTube or other video URL")):
+    return await _download_handler(request, url)
+
+
+@app.get("/api/get_file/{file_id}")
+async def api_get_file(file_id: str):
+    path = (_DOWNLOAD_DIR / file_id).resolve()
+    if not str(path).startswith(str(_DOWNLOAD_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid file id")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    ext = path.suffix.lower().lstrip(".")
+    media_type = _EXT_TO_MIME.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=media_type, filename=path.name)
+
+
+@app.get("/get_file/{file_id}")
+async def get_file_alias(file_id: str):
+    return await api_get_file(file_id)
 
 
 if __name__ == "__main__":
