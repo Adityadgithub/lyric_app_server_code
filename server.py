@@ -59,6 +59,15 @@ async def log_request_url(request: Request, call_next):
 
 @app.on_event("startup")
 async def _startup_download_gc():
+    logger.info(
+        "[config] YouTube proxy: %s",
+        "ENABLED" if _YOUTUBE_PROXY_URL else "DISABLED (set YOUTUBE_PROXY_URL to enable)",
+    )
+    logger.info(
+        "[config] Cookie generator: %s",
+        "ENABLED" if _COOKIE_GENERATOR_COMMAND else "DISABLED (set YOUTUBE_COOKIES_GENERATOR_COMMAND to enable)",
+    )
+
     async def _loop():
         while True:
             try:
@@ -371,6 +380,8 @@ def _run_yt_dlp_download_command(
         "node",
         "--remote-components",
         "ejs:github",
+        "--extractor-args",
+        "youtube:player_client=android,ios,web",
     ]
     if cookie_path:
         command.extend(["--cookies", cookie_path])
@@ -422,6 +433,14 @@ def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
         cookie_path, cookie_source = _resolve_youtube_cookiefile(
             force_generator_run=force_refresh or _COOKIE_FORCE_REFRESH_EACH_REQUEST
         )
+        logger.info(
+            "[yt-dlp][download] Attempt %s cookie state: source=%s path=%s force_refresh=%s force_each_request=%s",
+            attempt,
+            cookie_source or "none",
+            cookie_path or "none",
+            force_refresh,
+            _COOKIE_FORCE_REFRESH_EACH_REQUEST,
+        )
         if force_refresh:
             logger.info("[yt-dlp][download] Retry attempt %s with forced fresh cookies", attempt)
 
@@ -440,8 +459,9 @@ def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
         if attempt >= 3:
             raise RuntimeError(last_err or f"yt-dlp failed after retries (rc={proc.returncode})")
         logger.warning(
-            "[yt-dlp][download] Bot-check detected on attempt %s; forcing new cookies and retrying",
+            "[yt-dlp][download] Bot-check detected on attempt %s; forcing new cookies and retrying (proxy=%s)",
             attempt,
+            "ON" if _YOUTUBE_PROXY_URL else "OFF",
         )
 
     candidates = sorted(
@@ -534,16 +554,26 @@ def _resolve_youtube_cookiefile(*, force_generator_run: bool = False) -> tuple[s
     def _run_cookie_generator(*, async_run: bool) -> None:
         global _cookie_generator_last_run_ts, _cookie_generator_running
         if not _COOKIE_GENERATOR_COMMAND:
+            logger.info("[cookies] Generator command is not configured; skipping run")
             return
 
         now = time.time()
         with _cookie_cache_lock:
             if _cookie_generator_running:
+                logger.info(
+                    "[cookies] Generator already running; skipping new %s run",
+                    "async" if async_run else "sync",
+                )
                 return
             if (
                 not force_generator_run
                 and (now - _cookie_generator_last_run_ts) < _COOKIE_GENERATOR_MIN_INTERVAL_SECONDS
             ):
+                logger.info(
+                    "[cookies] Generator throttled by min interval (elapsed=%.1fs, min=%.1fs)",
+                    now - _cookie_generator_last_run_ts,
+                    _COOKIE_GENERATOR_MIN_INTERVAL_SECONDS,
+                )
                 return
             _cookie_generator_running = True
             _cookie_generator_last_run_ts = now
@@ -604,11 +634,26 @@ def _resolve_youtube_cookiefile(*, force_generator_run: bool = False) -> tuple[s
 
     source_path, source_label = _choose_cookie_source()
     now = time.time()
+    logger.info(
+        "[cookies] Resolve start: force_generator_run=%s source=%s path=%s",
+        force_generator_run,
+        source_label or "none",
+        source_path or "none",
+    )
 
     # If forced, or no cookie source exists, run sync generation now.
     if force_generator_run or not source_path:
+        logger.info(
+            "[cookies] Running sync generator (reason=%s)",
+            "forced" if force_generator_run else "missing_source",
+        )
         _run_cookie_generator(async_run=False)
         source_path, source_label = _choose_cookie_source()
+        logger.info(
+            "[cookies] Source after sync generator: source=%s path=%s",
+            source_label or "none",
+            source_path or "none",
+        )
 
     # If we have cookies, trigger opportunistic background refresh without blocking request.
     if (
@@ -616,6 +661,7 @@ def _resolve_youtube_cookiefile(*, force_generator_run: bool = False) -> tuple[s
         and not force_generator_run
         and _COOKIE_BACKGROUND_REFRESH_ON_ACCESS
     ):
+        logger.info("[cookies] Triggering async background generator refresh on access")
         _run_cookie_generator(async_run=True)
 
     if not source_path:
@@ -635,6 +681,12 @@ def _resolve_youtube_cookiefile(*, force_generator_run: bool = False) -> tuple[s
         cache_path_exists = os.path.isfile(_COOKIE_TMP_PATH)
         source_unchanged = _cookie_cache_source == source_path and _cookie_cache_sig == source_sig
         recently_checked = (now - _cookie_cache_last_check_ts) < _COOKIE_REFRESH_INTERVAL_SECONDS
+        logger.info(
+            "[cookies] Cache decision: source_unchanged=%s cache_path_exists=%s recently_checked=%s",
+            source_unchanged,
+            cache_path_exists,
+            recently_checked,
+        )
 
         # Fast path: reuse copied cookie file if source unchanged.
         if source_unchanged and cache_path_exists and recently_checked:
