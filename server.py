@@ -99,6 +99,7 @@ _RATE_LIMIT_PER_HOUR = int(os.environ.get("AUDIO_RATE_LIMIT_PER_HOUR", "5"))
 
 _NEWPIPE_EXTRACTOR_URL = os.environ.get("NEWPIPE_EXTRACTOR_URL", "").strip().rstrip("/")
 _NEWPIPE_EXTRACTOR_TIMEOUT = float(os.environ.get("NEWPIPE_EXTRACTOR_TIMEOUT_SECONDS", "25"))
+_YOUTUBE_USER_AGENT = os.environ.get("YOUTUBE_USER_AGENT", "").strip()
 
 _download_executor = ThreadPoolExecutor(
     max_workers=max(1, _MAX_CONCURRENT_DOWNLOADS),
@@ -343,6 +344,7 @@ def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
             return fast
 
     out_template = str(_DOWNLOAD_DIR / f"{cache_key}.%(ext)s")
+    cookie_path, cookie_source = _resolve_youtube_cookiefile()
 
     command = [
         sys.executable,
@@ -360,8 +362,22 @@ def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
         "node",
         "--remote-components",
         "ejs:github",
-        raw_url,
     ]
+    if cookie_path:
+        command.extend(["--cookies", cookie_path])
+        logger.info(
+            "[yt-dlp][download] Using cookies (source=%s, path=%s)",
+            cookie_source or "unknown",
+            cookie_path,
+        )
+    else:
+        logger.info("[yt-dlp][download] No cookie file available")
+
+    if _YOUTUBE_USER_AGENT:
+        command.extend(["--user-agent", _YOUTUBE_USER_AGENT])
+        logger.info("[yt-dlp][download] Using custom User-Agent from env")
+
+    command.append(raw_url)
 
     proc = subprocess.run(
         command,
