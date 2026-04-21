@@ -100,6 +100,7 @@ _RATE_LIMIT_PER_HOUR = int(os.environ.get("AUDIO_RATE_LIMIT_PER_HOUR", "5"))
 _NEWPIPE_EXTRACTOR_URL = os.environ.get("NEWPIPE_EXTRACTOR_URL", "").strip().rstrip("/")
 _NEWPIPE_EXTRACTOR_TIMEOUT = float(os.environ.get("NEWPIPE_EXTRACTOR_TIMEOUT_SECONDS", "25"))
 _YOUTUBE_USER_AGENT = os.environ.get("YOUTUBE_USER_AGENT", "").strip()
+_YOUTUBE_PROXY_URL = os.environ.get("YOUTUBE_PROXY_URL", "").strip()
 
 _download_executor = ThreadPoolExecutor(
     max_workers=max(1, _MAX_CONCURRENT_DOWNLOADS),
@@ -377,6 +378,10 @@ def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
         command.extend(["--user-agent", _YOUTUBE_USER_AGENT])
         logger.info("[yt-dlp][download] Using custom User-Agent from env")
 
+    if _YOUTUBE_PROXY_URL:
+        command.extend(["--proxy", _YOUTUBE_PROXY_URL])
+        logger.info("[yt-dlp][download] Using proxy from env")
+
     command.append(raw_url)
 
     proc = subprocess.run(
@@ -462,11 +467,6 @@ async def _ensure_downloaded(raw_url: str, *, rate_limit_key: str | None = None)
                         p.name,
                     )
                     return f"{cache_key}{p.suffix}", p.name, media
-
-        # Only enforce the per-IP hourly cap when we are about to spend real work
-        # (yt-dlp / network download). Cached responses should not consume quota.
-        if rate_limit_key is not None:
-            _enforce_rate_limit(rate_limit_key)
 
         async with _download_semaphore:
             loop = asyncio.get_running_loop()
@@ -992,7 +992,7 @@ async def _download_handler(request: Request, url: str) -> dict:
     try:
         file_id, filename, media_type = await _ensure_downloaded(
             raw_url,
-            rate_limit_key=client_ip,
+            rate_limit_key=None,
         )
     except HTTPException:
         raise
