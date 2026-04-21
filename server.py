@@ -80,12 +80,21 @@ _COOKIE_TMP_PATH = os.environ.get(
     "YOUTUBE_COOKIES_TMP_PATH",
     os.path.join(tempfile.gettempdir(), "lyrical_insta_cookies.txt"),
 )
+_COOKIE_GENERATOR_COMMAND = os.environ.get("YOUTUBE_COOKIES_GENERATOR_COMMAND", "").strip()
+_COOKIE_GENERATOR_TIMEOUT_SECONDS = float(
+    os.environ.get("YOUTUBE_COOKIES_GENERATOR_TIMEOUT_SECONDS", "60")
+)
+_COOKIE_GENERATOR_MIN_INTERVAL_SECONDS = float(
+    os.environ.get("YOUTUBE_COOKIES_GENERATOR_MIN_INTERVAL_SECONDS", "120")
+)
 _cookie_cache_lock = threading.Lock()
 _cookie_cache_source: str | None = None
 _cookie_cache_label: str | None = None
 _cookie_cache_sig: tuple[int, int] | None = None
 _cookie_cache_last_check_ts = 0.0
 _cookie_missing_logged_at = 0.0
+_cookie_generator_last_run_ts = 0.0
+_cookie_generator_running = False
 
 _DOWNLOAD_DIR = Path(
     os.environ.get("AUDIO_DOWNLOAD_DIR", str(_BACKEND_DIR / "downloads"))
@@ -480,6 +489,45 @@ def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
     """
     Return a stable, writable cookie path and only refresh when source changes.
     """
+    def _maybe_run_cookie_generator() -> None:
+        global _cookie_generator_last_run_ts, _cookie_generator_running
+        if not _COOKIE_GENERATOR_COMMAND:
+            return
+
+        now = time.time()
+        with _cookie_cache_lock:
+            if _cookie_generator_running:
+                return
+            if (now - _cookie_generator_last_run_ts) < _COOKIE_GENERATOR_MIN_INTERVAL_SECONDS:
+                return
+            _cookie_generator_running = True
+            _cookie_generator_last_run_ts = now
+
+        try:
+            logger.info("[cookies] Running generator command")
+            proc = subprocess.run(
+                _COOKIE_GENERATOR_COMMAND,
+                shell=True,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=max(_COOKIE_GENERATOR_TIMEOUT_SECONDS, 5.0),
+            )
+            if proc.returncode == 0:
+                logger.info("[cookies] Generator command completed successfully")
+            else:
+                err = (proc.stderr or proc.stdout or "").strip()
+                logger.warning(
+                    "[cookies] Generator command failed rc=%s detail=%s",
+                    proc.returncode,
+                    err[:300],
+                )
+        except Exception as e:
+            logger.warning("[cookies] Generator command error: %s", e)
+        finally:
+            with _cookie_cache_lock:
+                _cookie_generator_running = False
+
     def _file_sig(path: str) -> tuple[int, int] | None:
         try:
             st = os.stat(path)
@@ -500,6 +548,7 @@ def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
 
         return None, None
 
+    _maybe_run_cookie_generator()
     source_path, source_label = _choose_cookie_source()
     now = time.time()
     if not source_path:
