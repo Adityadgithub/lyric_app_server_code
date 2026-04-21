@@ -87,6 +87,12 @@ _COOKIE_GENERATOR_TIMEOUT_SECONDS = float(
 _COOKIE_GENERATOR_MIN_INTERVAL_SECONDS = float(
     os.environ.get("YOUTUBE_COOKIES_GENERATOR_MIN_INTERVAL_SECONDS", "120")
 )
+_COOKIE_FORCE_REFRESH_EACH_REQUEST = os.environ.get(
+    "YOUTUBE_COOKIES_FORCE_REFRESH_EACH_REQUEST", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+_COOKIE_BACKGROUND_REFRESH_ON_ACCESS = os.environ.get(
+    "YOUTUBE_COOKIES_BACKGROUND_REFRESH_ON_ACCESS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 _cookie_cache_lock = threading.Lock()
 _cookie_cache_source: str | None = None
 _cookie_cache_label: str | None = None
@@ -342,20 +348,13 @@ def _try_newpipe_http_download_to_cache(raw_url: str, cache_key: str) -> tuple[s
     return f"{cache_key}{final_path.suffix}", final_path.name, media
 
 
-def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
-    """
-    Returns (file_id, filename_on_disk, media_type).
-    """
-    cache_key = _cache_key_for_url(raw_url)
-
-    if _NEWPIPE_EXTRACTOR_URL:
-        fast = _try_newpipe_http_download_to_cache(raw_url, cache_key)
-        if fast:
-            return fast
-
-    out_template = str(_DOWNLOAD_DIR / f"{cache_key}.%(ext)s")
-    cookie_path, cookie_source = _resolve_youtube_cookiefile()
-
+def _run_yt_dlp_download_command(
+    *,
+    raw_url: str,
+    out_template: str,
+    cookie_path: str | None,
+    cookie_source: str | None,
+) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
         "-m",
@@ -392,16 +391,58 @@ def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
         logger.info("[yt-dlp][download] Using proxy from env")
 
     command.append(raw_url)
-
-    proc = subprocess.run(
+    return subprocess.run(
         command,
         capture_output=True,
         text=True,
         errors="replace",
     )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        raise RuntimeError(err or f"yt-dlp failed (rc={proc.returncode})")
+
+
+def _download_audio_file_sync(raw_url: str) -> tuple[str, str, str]:
+    """
+    Returns (file_id, filename_on_disk, media_type).
+    """
+    cache_key = _cache_key_for_url(raw_url)
+
+    if _NEWPIPE_EXTRACTOR_URL:
+        fast = _try_newpipe_http_download_to_cache(raw_url, cache_key)
+        if fast:
+            return fast
+
+    out_template = str(_DOWNLOAD_DIR / f"{cache_key}.%(ext)s")
+    # Up to 3 attempts total:
+    # 1) normal cookies (no forced regeneration)
+    # 2) on bot-check -> force fresh cookies + retry
+    # 3) if bot-check persists -> force fresh cookies once more + final retry
+    proc: subprocess.CompletedProcess[str] | None = None
+    last_err = ""
+    for attempt in range(1, 4):
+        force_refresh = attempt > 1
+        cookie_path, cookie_source = _resolve_youtube_cookiefile(
+            force_generator_run=force_refresh or _COOKIE_FORCE_REFRESH_EACH_REQUEST
+        )
+        if force_refresh:
+            logger.info("[yt-dlp][download] Retry attempt %s with forced fresh cookies", attempt)
+
+        proc = _run_yt_dlp_download_command(
+            raw_url=raw_url,
+            out_template=out_template,
+            cookie_path=cookie_path,
+            cookie_source=cookie_source,
+        )
+        if proc.returncode == 0:
+            break
+
+        last_err = (proc.stderr or proc.stdout or "").strip()
+        if not _youtube_error_suggests_cookie_retry(last_err):
+            raise RuntimeError(last_err or f"yt-dlp failed (rc={proc.returncode})")
+        if attempt >= 3:
+            raise RuntimeError(last_err or f"yt-dlp failed after retries (rc={proc.returncode})")
+        logger.warning(
+            "[yt-dlp][download] Bot-check detected on attempt %s; forcing new cookies and retrying",
+            attempt,
+        )
 
     candidates = sorted(
         _DOWNLOAD_DIR.glob(f"{cache_key}.*"),
@@ -485,11 +526,12 @@ async def _ensure_downloaded(raw_url: str, *, rate_limit_key: str | None = None)
             )
 
 
-def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
+def _resolve_youtube_cookiefile(*, force_generator_run: bool = False) -> tuple[str | None, str | None]:
     """
-    Return a stable, writable cookie path and only refresh when source changes.
+    Return a stable, writable cookie path.
+    Uses stale-while-valid behavior: return current cookies immediately and refresh in background.
     """
-    def _maybe_run_cookie_generator() -> None:
+    def _run_cookie_generator(*, async_run: bool) -> None:
         global _cookie_generator_last_run_ts, _cookie_generator_running
         if not _COOKIE_GENERATOR_COMMAND:
             return
@@ -498,35 +540,47 @@ def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
         with _cookie_cache_lock:
             if _cookie_generator_running:
                 return
-            if (now - _cookie_generator_last_run_ts) < _COOKIE_GENERATOR_MIN_INTERVAL_SECONDS:
+            if (
+                not force_generator_run
+                and (now - _cookie_generator_last_run_ts) < _COOKIE_GENERATOR_MIN_INTERVAL_SECONDS
+            ):
                 return
             _cookie_generator_running = True
             _cookie_generator_last_run_ts = now
 
-        try:
-            logger.info("[cookies] Running generator command")
-            proc = subprocess.run(
-                _COOKIE_GENERATOR_COMMAND,
-                shell=True,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=max(_COOKIE_GENERATOR_TIMEOUT_SECONDS, 5.0),
-            )
-            if proc.returncode == 0:
-                logger.info("[cookies] Generator command completed successfully")
-            else:
-                err = (proc.stderr or proc.stdout or "").strip()
-                logger.warning(
-                    "[cookies] Generator command failed rc=%s detail=%s",
-                    proc.returncode,
-                    err[:300],
+        def _execute() -> None:
+            global _cookie_cache_last_check_ts, _cookie_generator_running
+            try:
+                logger.info("[cookies] Running generator command (%s)", "async" if async_run else "sync")
+                proc = subprocess.run(
+                    _COOKIE_GENERATOR_COMMAND,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=max(_COOKIE_GENERATOR_TIMEOUT_SECONDS, 5.0),
                 )
-        except Exception as e:
-            logger.warning("[cookies] Generator command error: %s", e)
-        finally:
-            with _cookie_cache_lock:
-                _cookie_generator_running = False
+                if proc.returncode == 0:
+                    logger.info("[cookies] Generator command completed successfully")
+                else:
+                    err = (proc.stderr or proc.stdout or "").strip()
+                    logger.warning(
+                        "[cookies] Generator command failed rc=%s detail=%s",
+                        proc.returncode,
+                        err[:300],
+                    )
+            except Exception as e:
+                logger.warning("[cookies] Generator command error: %s", e)
+            finally:
+                with _cookie_cache_lock:
+                    # Mark cache as stale so next resolve re-checks copied cookie quickly.
+                    _cookie_cache_last_check_ts = 0.0
+                    _cookie_generator_running = False
+
+        if async_run:
+            threading.Thread(target=_execute, name="cookie_gen_bg", daemon=True).start()
+        else:
+            _execute()
 
     def _file_sig(path: str) -> tuple[int, int] | None:
         try:
@@ -548,9 +602,22 @@ def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
 
         return None, None
 
-    _maybe_run_cookie_generator()
     source_path, source_label = _choose_cookie_source()
     now = time.time()
+
+    # If forced, or no cookie source exists, run sync generation now.
+    if force_generator_run or not source_path:
+        _run_cookie_generator(async_run=False)
+        source_path, source_label = _choose_cookie_source()
+
+    # If we have cookies, trigger opportunistic background refresh without blocking request.
+    if (
+        source_path
+        and not force_generator_run
+        and _COOKIE_BACKGROUND_REFRESH_ON_ACCESS
+    ):
+        _run_cookie_generator(async_run=True)
+
     if not source_path:
         global _cookie_missing_logged_at
         if now - _cookie_missing_logged_at >= _COOKIE_REFRESH_INTERVAL_SECONDS:
