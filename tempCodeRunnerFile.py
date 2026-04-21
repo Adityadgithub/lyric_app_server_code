@@ -1,1 +1,0 @@
-get_ytmusic_synced_lyrics

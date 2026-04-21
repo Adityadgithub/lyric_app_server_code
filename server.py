@@ -12,6 +12,8 @@ import os
 import re
 import shutil
 import sys
+import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -73,11 +75,23 @@ ytmusic_client = YTMusic()
 
 _BACKEND_DIR = Path(__file__).resolve().parent
 _DEFAULT_COOKIES_FILE = _BACKEND_DIR / "cookies.txt"
+_COOKIE_REFRESH_INTERVAL_SECONDS = float(os.environ.get("YOUTUBE_COOKIES_REFRESH_SECONDS", "30"))
+_COOKIE_TMP_PATH = os.environ.get(
+    "YOUTUBE_COOKIES_TMP_PATH",
+    os.path.join(tempfile.gettempdir(), "lyrical_insta_cookies.txt"),
+)
+_cookie_cache_lock = threading.Lock()
+_cookie_cache_source: str | None = None
+_cookie_cache_label: str | None = None
+_cookie_cache_sig: tuple[int, int] | None = None
+_cookie_cache_last_check_ts = 0.0
+_cookie_missing_logged_at = 0.0
 
 _DOWNLOAD_DIR = Path(
     os.environ.get("AUDIO_DOWNLOAD_DIR", str(_BACKEND_DIR / "downloads"))
 ).resolve()
 _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+_EXTERNAL_FILE_BASE_URL = os.environ.get("AUDIO_EXTERNAL_FILE_BASE_URL", "").strip().rstrip("/")
 
 _MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("AUDIO_MAX_CONCURRENT_DOWNLOADS", "3"))
 _DOWNLOAD_TTL_SECONDS = int(os.environ.get("AUDIO_DOWNLOAD_TTL_SECONDS", str(60 * 60)))
@@ -102,6 +116,20 @@ def _client_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return "unknown"
+
+
+def _build_file_url(request: Request, file_id: str) -> str:
+    """
+    Returns the playback URL sent back to the app.
+    - If AUDIO_EXTERNAL_FILE_BASE_URL is configured, return an external/CDN URL.
+    - Otherwise, fall back to local FastAPI `/get_file/{file_id}`.
+    """
+    encoded_file_id = quote(file_id, safe="")
+    if _EXTERNAL_FILE_BASE_URL:
+        return f"{_EXTERNAL_FILE_BASE_URL}/{encoded_file_id}"
+
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/get_file/{encoded_file_id}"
 
 
 def _enforce_rate_limit(client_ip: str) -> None:
@@ -434,36 +462,70 @@ async def _ensure_downloaded(raw_url: str, *, rate_limit_key: str | None = None)
 
 def _resolve_youtube_cookiefile() -> tuple[str | None, str | None]:
     """
-    Always return a writable cookie file path (Render-safe)
+    Return a stable, writable cookie path and only refresh when source changes.
     """
-
-    TMP_PATH = "/tmp/cookies.txt"
-
-    def copy_to_tmp(src: str, label: str):
+    def _file_sig(path: str) -> tuple[int, int] | None:
         try:
-            shutil.copy2(src, TMP_PATH)
-            logger.info(f"[cookies] ✅ Copied {label} → {TMP_PATH}")
-            return TMP_PATH, label
-        except Exception as e:
-            logger.warning(f"[cookies] ❌ Copy failed: {e}")
-            return src, label
+            st = os.stat(path)
+            return st.st_size, int(st.st_mtime)
+        except OSError:
+            return None
 
-    # 1. ENV (Render secret file)
-    env_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    def _choose_cookie_source() -> tuple[str | None, str | None]:
+        # 1) ENV (Render/host secret file)
+        env_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+        if env_path and os.path.isfile(env_path):
+            return env_path, "ENV"
 
-    if env_path and os.path.isfile(env_path):
-        logger.info("[cookies] Using ENV cookie file")
-        return copy_to_tmp(env_path, "ENV")
+        # 2) Local fallback
+        local_path = _DEFAULT_COOKIES_FILE
+        if local_path.is_file():
+            return str(local_path), "local"
 
-    # 2. Local fallback
-    local_path = _DEFAULT_COOKIES_FILE
+        return None, None
 
-    if local_path.is_file():
-        logger.info("[cookies] Using local cookies.txt")
-        return copy_to_tmp(str(local_path), "local")
+    source_path, source_label = _choose_cookie_source()
+    now = time.time()
+    if not source_path:
+        global _cookie_missing_logged_at
+        if now - _cookie_missing_logged_at >= _COOKIE_REFRESH_INTERVAL_SECONDS:
+            logger.warning("[cookies] ❌ No cookies found")
+            _cookie_missing_logged_at = now
+        return None, None
 
-    logger.warning("[cookies] ❌ No cookies found")
-    return None, None
+    source_sig = _file_sig(source_path)
+    if not source_sig:
+        logger.warning("[cookies] Source cookie file is not readable: %s", source_path)
+        return None, None
+
+    global _cookie_cache_source, _cookie_cache_label, _cookie_cache_sig, _cookie_cache_last_check_ts
+    with _cookie_cache_lock:
+        cache_path_exists = os.path.isfile(_COOKIE_TMP_PATH)
+        source_unchanged = _cookie_cache_source == source_path and _cookie_cache_sig == source_sig
+        recently_checked = (now - _cookie_cache_last_check_ts) < _COOKIE_REFRESH_INTERVAL_SECONDS
+
+        # Fast path: reuse copied cookie file if source unchanged.
+        if source_unchanged and cache_path_exists and recently_checked:
+            return _COOKIE_TMP_PATH, _cookie_cache_label
+
+        should_copy = not source_unchanged or not cache_path_exists
+        if should_copy:
+            try:
+                cookie_tmp_parent = os.path.dirname(_COOKIE_TMP_PATH)
+                if cookie_tmp_parent:
+                    os.makedirs(cookie_tmp_parent, exist_ok=True)
+                shutil.copy2(source_path, _COOKIE_TMP_PATH)
+                logger.info("[cookies] ✅ Synced %s cookies → %s", source_label, _COOKIE_TMP_PATH)
+            except Exception as e:
+                logger.warning("[cookies] ❌ Copy failed, using source directly: %s", e)
+                _cookie_cache_last_check_ts = now
+                return source_path, source_label
+
+        _cookie_cache_source = source_path
+        _cookie_cache_label = source_label
+        _cookie_cache_sig = source_sig
+        _cookie_cache_last_check_ts = now
+        return _COOKIE_TMP_PATH, source_label
 
 
 def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
@@ -480,8 +542,16 @@ def _youtube_error_suggests_cookie_retry(msg: str) -> bool:
     )
 
 
-def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
-    resolved_path, resolved_source = _resolve_youtube_cookiefile()
+def _yt_dlp_opts(
+    *,
+    skip_cookiefile: bool = False,
+    cookie_path: str | None = None,
+    cookie_source: str | None = None,
+) -> dict:
+    resolved_path = cookie_path
+    resolved_source = cookie_source
+    if resolved_path is None and resolved_source is None:
+        resolved_path, resolved_source = _resolve_youtube_cookiefile()
 
     # 🔥 KEY FIX: Always allow mobile clients FIRST
     if skip_cookiefile:
@@ -493,7 +563,13 @@ def _yt_dlp_opts(*, skip_cookiefile: bool = False) -> dict:
         # 🔥 IMPORTANT: include mobile even WITH cookies
         player_client = ["android", "ios", "web"]
         if cookies_path:
-            logger.info("[yt-dlp] Using cookies + mobile clients")
+            logger.info(
+                "[yt-dlp] Using cookies + mobile clients (source=%s, path=%s)",
+                resolved_source or "unknown",
+                cookies_path,
+            )
+        else:
+            logger.info("[yt-dlp] Cookies requested but unavailable; running without cookies")
 
     # Prefer audio-only; "best" can fail on some restricted/odd manifests.
     opts: dict = {
@@ -634,7 +710,7 @@ def get_audio_stream(url: str) -> dict:
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, RuntimeError, ValueError) as e:
             logger.warning("[get_audio_stream] NewPipe sidecar failed; falling back to yt-dlp: %s", e)
 
-    cookie_path, _ = _resolve_youtube_cookiefile()
+    cookie_path, cookie_source = _resolve_youtube_cookiefile()
     phases: list[tuple[bool, str]] = []
     if cookie_path:
         phases.append((True, "without cookies"))
@@ -643,7 +719,25 @@ def get_audio_stream(url: str) -> dict:
     last_download_error: DownloadError | None = None
 
     for skip_cookies, phase_label in phases:
-        ydl_opts = _yt_dlp_opts(skip_cookiefile=skip_cookies)
+        ydl_opts = _yt_dlp_opts(
+            skip_cookiefile=skip_cookies,
+            cookie_path=cookie_path,
+            cookie_source=cookie_source,
+        )
+        active_cookie_path = ydl_opts.get("cookiefile")
+        if active_cookie_path:
+            logger.info(
+                "[get_audio_stream] Cookie mode=ON (phase=%s, source=%s, path=%s)",
+                phase_label,
+                cookie_source or "unknown",
+                active_cookie_path,
+            )
+        else:
+            logger.info(
+                "[get_audio_stream] Cookie mode=OFF (phase=%s, reason=%s)",
+                phase_label,
+                "explicit skip" if skip_cookies else "no cookie file available",
+            )
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 logger.info(
@@ -657,7 +751,13 @@ def get_audio_stream(url: str) -> dict:
                 logger.error("[get_audio_stream] yt-dlp returned no info")
                 raise ValueError("Failed to extract video info")
 
-            return _info_dict_to_stream_result(info)
+            result = _info_dict_to_stream_result(info)
+            logger.info(
+                "[get_audio_stream] Extraction success with cookies=%s (phase=%s)",
+                "yes" if active_cookie_path else "no",
+                phase_label,
+            )
+            return result
 
         except DownloadError as e:
             last_download_error = e
@@ -884,13 +984,13 @@ async def _download_handler(request: Request, url: str) -> dict:
         logger.exception("[downloads] download failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    base = str(request.base_url).rstrip("/")
-    file_url = f"{base}/get_file/{file_id}"
+    file_url = _build_file_url(request, file_id)
     logger.info(
-        "[downloads] ready file_id=%s filename=%s media_type=%s",
+        "[downloads] ready file_id=%s filename=%s media_type=%s external_url=%s",
         file_id,
         filename,
         media_type,
+        "yes" if _EXTERNAL_FILE_BASE_URL else "no",
     )
     return {
         "success": True,
